@@ -23,7 +23,7 @@ setup(
             include_dirs=include_paths(),
             extra_compile_args={
                 'cxx': ['-O3'],
-                'nvcc': ['-O3', '-Xptxas=-v', '-arch=sm_80']
+                'nvcc': ['-O3', '-Xptxas=-v', '-arch=sm_75']
             }
         ),
 

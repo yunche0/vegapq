@@ -52,6 +52,20 @@ typedef float DISTANCE_T;
 
 /////////////////////////////////////////////////////// debug ///////////////////////////////////////////////////////
 
+__device__ float pq_distance(const float* query, const float* codebook, int dim) {
+    constexpr int M = 8, Ks = 256;
+    int dsub = dim / M;
+    float dist = 0.0f;
+    for (int m = 0; m < M; ++m) {
+        const float* cent = codebook + m * Ks * dsub;   // 硬编码 idx=0
+        for (int j = 0; j < dsub; ++j) {
+            float diff = query[m * dsub + j] - cent[j];
+            dist += diff * diff;
+        }
+    }
+    return dist;
+}
+
 template <typename T>
 __device__ inline void print_buffer(T* buffer, uint32_t buffer_size)
 {
@@ -538,23 +552,9 @@ __device__ DISTANCE_T compute_similarity_vector_load_full
             dl_buff[e] = reinterpret_cast<float4*>(child_data_ptr)[k / 4];
         }
         
-        // Compute
-        #pragma unroll
-        for (uint32_t e = 0; e < reg_nelem; e++) 
-        {
-            const uint32_t k = (lane_id + (TEAM_SIZE * e)) * vlen;
-            if (k >= VECTOR_DIM) break;
-
-            DISTANCE_T d = query_ptr[k];
-            norm2 += (d - dl_buff[e].x) * (d - dl_buff[e].x);
-            d = query_ptr[k + 1];
-            norm2 += (d - dl_buff[e].y) * (d - dl_buff[e].y);
-            d = query_ptr[k + 2];
-            norm2 += (d - dl_buff[e].z) * (d - dl_buff[e].z);
-            d = query_ptr[k + 3];
-            norm2 += (d - dl_buff[e].w) * (d - dl_buff[e].w);
-
-        }
+       // Compute  ←←← 只改这里
+        if (valid_child)
+            norm2 = pq_distance(query_ptr, d_pq_codebook, VECTOR_DIM);
     }
 
     unsigned team_mask = __ballot_sync(0xffffffff, valid_child);
@@ -1256,6 +1256,7 @@ __device__ inline void compute_distance_to_child_nodes_team_with_direction
     __syncwarp(0xffffffff);
 
     // sort
+        // ===== 方向排序：得分越高越像查询方向 =====
     candidate_by_bitonic_sort_inverse<2, INTERNAL_TOPK / 32>
         (
             candidate_indices_ptr,
@@ -1265,15 +1266,35 @@ __device__ inline void compute_distance_to_child_nodes_team_with_direction
 
     __syncwarp(0xffffffff);
 
-    uint32_t max_tid = CANDIDATE_BUFFER_SIZE * TEAM_SIZE * PRUNE_RATIO + CANDIDATE_BUFFER_SIZE - CANDIDATE_BUFFER_SIZE * PRUNE_RATIO;
-    for (uint32_t tid = threadIdx.x; tid < max_tid ; tid += blockDim.x)
-    {
-        if (tid < CANDIDATE_BUFFER_SIZE * TEAM_SIZE * PRUNE_RATIO)
-        {
+    // ---- Fallback：方向筛太狠时回退 ----
+    const INDEX_T invalid_index = std::numeric_limits<INDEX_T>::max();
+    __shared__ int selected_cnt;                 // 前 PRUNE_RATIO 里有效节点数
+    if (threadIdx.x == 0) {
+        selected_cnt = 0;
+        const int limit = CANDIDATE_BUFFER_SIZE * PRUNE_RATIO;
+        for (int i = 0; i < limit; ++i)
+            if (candidate_indices_ptr[i] != invalid_index) ++selected_cnt;
+    }
+    __syncthreads();
+
+    const int n_fallback = 4;                    // 硬编码阈值，后续可改参数
+    if (selected_cnt < n_fallback) {
+        // 把被筛掉的邻居重新标记为“待算距离”
+        for (int i = threadIdx.x; i < CANDIDATE_BUFFER_SIZE; i += blockDim.x)
+            if (candidate_distances_ptr[i] == -99999999.0f)   // 方向淘汰标记
+                candidate_distances_ptr[i] = 0.0f;            // 0 表示后面会算 L2
+    }
+    __syncthreads();
+
+    // ===== 正常距离计算（前 PRUNE_RATIO 行） =====
+    uint32_t max_tid = CANDIDATE_BUFFER_SIZE * TEAM_SIZE * PRUNE_RATIO
+                     + CANDIDATE_BUFFER_SIZE
+                     - CANDIDATE_BUFFER_SIZE * PRUNE_RATIO;
+    for (uint32_t tid = threadIdx.x; tid < max_tid; tid += blockDim.x) {
+        if (tid < CANDIDATE_BUFFER_SIZE * TEAM_SIZE * PRUNE_RATIO) {
             uint32_t i = tid / TEAM_SIZE;
             INDEX_T child_id = candidate_indices_ptr[i];
 
-            // Distance calculation
             DISTANCE_T norm2 = compute_similarity_vector_load_full<VECTOR_DIM, TEAM_SIZE>
                                         (
                                             d_dataset_ptr,
@@ -1281,29 +1302,20 @@ __device__ inline void compute_distance_to_child_nodes_team_with_direction
                                             child_id,
                                             child_id != invalid_index
                                         );
-            
+
             uint8_t lane_id = threadIdx.x % TEAM_SIZE;
-            if (lane_id == 0)
-            {
-                if(child_id != invalid_index)
-                {
+            if (lane_id == 0) {
+                if (child_id != invalid_index)
                     candidate_distances_ptr[i] = norm2;
-                }
                 else
-                {
                     candidate_distances_ptr[i] = std::numeric_limits<DISTANCE_T>::max();
-                }
             }
-        }
-        else
-        {
-            uint32_t i = tid - CANDIDATE_BUFFER_SIZE * TEAM_SIZE * PRUNE_RATIO + CANDIDATE_BUFFER_SIZE * PRUNE_RATIO;
+        } else {
+            uint32_t i = tid - CANDIDATE_BUFFER_SIZE * TEAM_SIZE * PRUNE_RATIO
+                         + CANDIDATE_BUFFER_SIZE * PRUNE_RATIO;
             candidate_distances_ptr[i] = std::numeric_limits<DISTANCE_T>::max();
         }
-
     }
-
-}
 
 /////////////////////////////////////////////////////// main search kernel ///////////////////////////////////////////////////////
 
@@ -1337,7 +1349,8 @@ __global__ void search_kernel
     uint32_t FULL_COMPUTE_RATIO,
     uint32_t SEED_CONFIG,
     uint32_t HASH_TABLE_CONFIG,
-    uint32_t SEED_TOPK_SIZE
+    uint32_t SEED_TOPK_SIZE,
+    float* d_pq_codebook   // 新增 PQ 码本指针
 )
 {
 
@@ -1635,8 +1648,7 @@ __global__ void search_kernel
     #endif
 }
 
-torch::Tensor search
-(
+torch::Tensor search(
     torch::Tensor graph, 
     torch::Tensor dataset, 
     torch::Tensor queries, 
@@ -1647,7 +1659,28 @@ torch::Tensor search
     torch::Tensor results_distances
 ) 
 {
-    
+    // ===== 1. 动态选表 =====
+    std::vector<torch::Tensor> sign_bit_tables(8);
+    torch::Tensor centers = torch::from_numpy(
+        np.load("/root/autodl-tmp/PathWeaver/_datasets/sift-128-euclidean/query_cluster_centers.npy")
+    ).cuda();
+    for (int c = 0; c < 8; ++c) {
+        sign_bit_tables[c] = torch::from_numpy(
+            np.load(f"/root/autodl-tmp/PathWeaver/_datasets/sift-128-euclidean/sign_bit_table_c{c}.npy")
+        ).cuda();
+    }
+    // 用第 0 条查询当代表（batch 内统一选表）
+    torch::Tensor query_batch = queries.slice(0, 0, 1);   // [1, dim]
+    torch::Tensor dists = torch::sum((query_batch - centers).pow(2), 1);  // [C]
+    int64_t cluster_id = dists.argmin().item<int64_t>();
+    torch::Tensor sign_bit = sign_bit_tables[cluster_id];   // 覆盖原参数
+
+    // ===== 2. PQ 码本 =====
+    torch::Tensor pq_codebook = torch::from_numpy(
+        np.load("/autodl-tmp/PathWeaver/_datasets/sift-128-euclidean/pq_codebook.npy")
+    ).cuda();
+    float* d_pq_codebook = pq_codebook.data_ptr<float>();
+
     if (!graph.is_cuda())
     {
         throw std::runtime_error("Input tensor 'graph' must be on GPU.");
@@ -1764,7 +1797,8 @@ torch::Tensor search
                     FULL_COMPUTE_RATIO,
                     SEED_CONFIG,
                     HASH_TABLE_CONFIG,
-                    SEED_TOPK_SIZE
+                    SEED_TOPK_SIZE,
+		    d_pq_codebook   // 新增 PQ 码本指针
                 );
             }
             else if(INTERNAL_TOPK == 128)
