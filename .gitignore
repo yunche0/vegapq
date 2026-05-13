@@ -1,3 +1,7 @@
 _*/
 docker/
-file_tracker.txt
+file_tracker.txt.ipynb_checkpoints/
+*.so
+*.hdf5
+*.fbin
+*.bak
