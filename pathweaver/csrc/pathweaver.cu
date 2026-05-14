@@ -602,7 +602,7 @@ __device__ inline void compute_distance_to_child_nodes_team_with_direction_pq
     const INDEX_T smem_parent_id = parent_buffer[0];
     const auto parent_id = internal_topk_list[smem_parent_id] & ~index_msb_1_mask;
 
-    // Pre-compute sign bits of query relative to parent for SIGN_BIT_PRUNE
+
     constexpr uint32_t packed_vector_dim_size = (VECTOR_DIM + 31) / 32;
     __shared__ int32_t query_sign_bit[packed_vector_dim_size];
 
@@ -819,7 +819,7 @@ __global__ void search_kernel
     auto terminate_flag = reinterpret_cast<uint32_t*>(parent_list_buffer + SEARCH_WIDTH);
     terminate_flag[0] = 0;
     auto counter = reinterpret_cast<uint32_t*>(terminate_flag + 1);
-    // dist_table placed after counter, ensure alignment (float)
+
     float* dist_table = reinterpret_cast<float*>(counter + 1);
 
     if (HASH_TABLE_CONFIG) {
@@ -846,7 +846,7 @@ __global__ void search_kernel
     }
     __syncthreads();
 
-    // Initialize result buffers
+  
     for (uint32_t i = threadIdx.x; i < RESULT_BUFFER_SIZE; i += blockDim.x) {
         result_indices_buffer[i] = std::numeric_limits<INDEX_T>::max();
         result_distances_buffer[i] = std::numeric_limits<DISTANCE_T>::max();
@@ -1068,8 +1068,7 @@ torch::Tensor search(
     dim3 thread_dims(BLOCK_SIZE, 1, 1);
     dim3 block_dims(1, NUM_QUERIES, 1);
 
-    // Instantiate based on VECTOR_DIM and INTERNAL_TOPK
-    // Add more cases as needed for other dimensions.
+
     if (VECTOR_DIM == 128) {
         if (INTERNAL_TOPK == 64) {
             search_kernel<128, 64><<<block_dims, thread_dims, SHARED_MEM_SIZE>>>(
