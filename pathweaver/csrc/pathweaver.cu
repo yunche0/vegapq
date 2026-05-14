@@ -36,9 +36,9 @@ typedef float DISTANCE_T;
 #define NO_SEED 0
 #define USE_SEED 1
 
-// ========== PQ constants ==========
-constexpr int PQ_M = 8;          // number of sub-quantizers
-constexpr int PQ_Ks = 256;       // codebook size per sub-quantizer
+
+constexpr int PQ_M = 8;         
+constexpr int PQ_Ks = 256;       
 
 /////////////////////////////////////////////////////// hash table ///////////////////////////////////////////////////////
 
@@ -92,7 +92,7 @@ __device__ inline void hashtable_restore
     }
 }
 
-/////////////////////////////////////////////////////// sort routines (unchanged) ///////////////////////////////////////////////////////
+/////////////////////////////////////////////////////// sort routines ///////////////////////////////////////////////////////
 
 template <class K, class V>
 __device__ inline void swap_if_needed(K& k0, V& v0, const unsigned lane_offset, const bool asc)
@@ -393,7 +393,7 @@ __device__ DISTANCE_T compute_similarity_pq
     uint8_t* d_pq_codes,
     INDEX_T child_id,
     bool valid_child,
-    float* dist_table          // shared memory: [PQ_M][PQ_Ks]
+    float* dist_table         
 )
 {
     DISTANCE_T norm2 = 0.0f;
@@ -410,7 +410,7 @@ __device__ DISTANCE_T compute_similarity_pq
     return norm2;
 }
 
-// Batch PQ distance computation for candidate buffer
+
 template<uint32_t VECTOR_DIM, uint32_t TEAM_SIZE>
 __device__ void compute_distance_pq_batch
 (
@@ -625,7 +625,7 @@ __device__ inline void compute_distance_to_child_nodes_team_with_direction_pq
         __syncthreads();
     }
 
-    // Step 1: compute direction scores for all neighbors
+
     for (uint32_t i = threadIdx.x; i < CANDIDATE_BUFFER_SIZE; i += blockDim.x) {
         INDEX_T child_id = d_graph_ptr[(static_cast<int64_t>(GRAPH_DEGREE) * parent_id) + i];
         // Remove duplicates already in internal topk
@@ -657,12 +657,12 @@ __device__ inline void compute_distance_to_child_nodes_team_with_direction_pq
     }
     __syncthreads();
 
-    // Step 2: sort by direction score descending (higher score = more promising)
+   
     candidate_by_bitonic_sort_inverse<2, INTERNAL_TOPK / 32>
         (candidate_indices_ptr, candidate_distances_ptr, CANDIDATE_BUFFER_SIZE);
     __syncthreads();
 
-    // Step 3: determine how many nodes to compute exact PQ distance
+   
     int keep = max(1, static_cast<int>(CANDIDATE_BUFFER_SIZE * PRUNE_RATIO));
     __shared__ int selected_cnt;
     if (threadIdx.x == 0) {
@@ -678,7 +678,7 @@ __device__ inline void compute_distance_to_child_nodes_team_with_direction_pq
         keep = CANDIDATE_BUFFER_SIZE;
     }
 
-    // Step 4: compute PQ distance for the kept nodes, set others to FLT_MAX
+   
     for (uint32_t tid = threadIdx.x; tid < CANDIDATE_BUFFER_SIZE * TEAM_SIZE; tid += blockDim.x) {
         uint32_t i = tid / TEAM_SIZE;
         bool compute = (i < keep);
@@ -699,7 +699,7 @@ __device__ inline void compute_distance_to_child_nodes_team_with_direction_pq
     __syncthreads();
 }
 
-// Fallback when direction pruning is not used (compute all neighbors with PQ)
+
 template <uint32_t VECTOR_DIM, uint32_t TEAM_SIZE, uint32_t INTERNAL_TOPK>
 __device__ void compute_distance_to_child_nodes_pq
 (
@@ -810,7 +810,7 @@ __global__ void search_kernel
     uint32_t QUERY_BUFFER_SIZE = VECTOR_DIM;
     uint32_t hash_table_size = 1 << BITLEN;
 
-    // Shared memory layout
+   
     auto query_buffer = reinterpret_cast<DATA_T*>(smem);
     auto result_indices_buffer = reinterpret_cast<INDEX_T*>(query_buffer + QUERY_BUFFER_SIZE);
     auto result_distances_buffer = reinterpret_cast<DISTANCE_T*>(result_indices_buffer + RESULT_BUFFER_SIZE);
@@ -826,12 +826,12 @@ __global__ void search_kernel
         hashtable_init(visited_hash_buffer, BITLEN);
     }
 
-    // Load query vector
+   
     for (uint32_t i = threadIdx.x; i < VECTOR_DIM; i += blockDim.x) {
         query_buffer[i] = d_queries_ptr[query_id * VECTOR_DIM + i];
     }
 
-    // Build PQ distance lookup table for this query (shared memory)
+    
     const int total_dist_entries = PQ_M * PQ_Ks;
     for (int idx = threadIdx.x; idx < total_dist_entries; idx += blockDim.x) {
         int m = idx / PQ_Ks;
@@ -853,7 +853,7 @@ __global__ void search_kernel
     }
     __syncthreads();
 
-    // Seed initialization
+
     if (SEED_CONFIG == NO_SEED) {
         compute_distance_to_random_nodes_pq<VECTOR_DIM, 8>
         (
@@ -915,7 +915,7 @@ __global__ void search_kernel
 
         if (iter + 1 == MAX_ITER) break;
 
-        // Pick next parents
+        
         if (threadIdx.x < 32) {
             pickup_next_parents
                 (
@@ -942,7 +942,6 @@ __global__ void search_kernel
 
         if (*terminate_flag && iter >= MIN_ITER) break;
 
-        // Compute distances to child nodes (with or without direction pruning)
         if (PRUNE_CONFIG != NO_PRUNE && iter < MAX_ITER * ITERATION_DIRECTION_RATIO) {
             compute_distance_to_child_nodes_team_with_direction_pq<VECTOR_DIM, 8, INTERNAL_TOPK>
             (
@@ -989,7 +988,7 @@ __global__ void search_kernel
         iter++;
     }
 
-    // Final sort
+
     topk_by_bitonic_sort<2, INTERNAL_TOPK / 32>
             (
                 result_indices_buffer,
@@ -1001,7 +1000,7 @@ __global__ void search_kernel
             );
     __syncthreads();
 
-    // Write results
+
     for (uint32_t i = threadIdx.x; i < TOPK; i += blockDim.x) {
         d_results_ptr[query_id * TOPK + i] = result_indices_buffer[i] & ~0x80000000;
         d_distances_ptr[query_id * TOPK + i] = result_distances_buffer[i];
