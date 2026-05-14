@@ -1,20 +1,9 @@
 /*
  * Copyright (c) 2023-2024, NVIDIA CORPORATION.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * Modified by Sukjin Kim & Assistant, 2025
+ * 
+ * Added true PQ distance computation with direction pruning fallback.
  */
-
-// Modified by Sukjin Kim, 2025
 
 #include <pybind11/pybind11.h>
 #include <torch/extension.h>
@@ -32,9 +21,6 @@
 
 namespace py = pybind11;
 
-// #define _CLK_BREAKDOWN
-// #define PRINT
-
 typedef float DATA_T;
 typedef uint32_t INDEX_T;
 typedef float DISTANCE_T;
@@ -50,39 +36,9 @@ typedef float DISTANCE_T;
 #define NO_SEED 0
 #define USE_SEED 1
 
-/////////////////////////////////////////////////////// debug ///////////////////////////////////////////////////////
-
-__device__ float pq_distance(const float* query, const float* codebook, int dim) {
-    constexpr int M = 8, Ks = 256;
-    int dsub = dim / M;
-    float dist = 0.0f;
-    for (int m = 0; m < M; ++m) {
-        const float* cent = codebook + m * Ks * dsub;   // 硬编码 idx=0
-        for (int j = 0; j < dsub; ++j) {
-            float diff = query[m * dsub + j] - cent[j];
-            dist += diff * diff;
-        }
-    }
-    return dist;
-}
-
-template <typename T>
-__device__ inline void print_buffer(T* buffer, uint32_t buffer_size)
-{
-    if constexpr (std::is_same<T, INDEX_T>::value) {
-        for (uint32_t i = 0; i < buffer_size; i++) {
-            printf("%d, ", buffer[i]);
-        }
-    } else if constexpr (std::is_same<T, DISTANCE_T>::value || std::is_same<T, DATA_T>::value) {
-        for (uint32_t i = 0; i < buffer_size; i++) {
-            printf("%f, ", buffer[i]);
-        }
-    } else {
-        printf("Unsupported type\n");
-        assert(false);
-    }
-    printf("\n");
-}
+// ========== PQ constants ==========
+constexpr int PQ_M = 8;          // number of sub-quantizers
+constexpr int PQ_Ks = 256;       // codebook size per sub-quantizer
 
 /////////////////////////////////////////////////////// hash table ///////////////////////////////////////////////////////
 
@@ -102,28 +58,20 @@ __device__ inline void hashtable_init(INDEX_T* const table, const unsigned BITLE
 
 __device__ inline uint32_t hashtable_insert(INDEX_T* const table, const unsigned BITLEN, const INDEX_T key)
 {
-    // Open addressing is used for collision resolution
     const uint32_t size     = hashtable_getsize(BITLEN);
     const uint32_t bit_mask = size - 1;
-
-    // Linear probing
     INDEX_T index                = (key ^ (key >> BITLEN)) & bit_mask;
     constexpr uint32_t stride = 1;
-
     for (unsigned i = 0; i < size; i++)
     {
         const INDEX_T old = atomicCAS(&table[index], ~static_cast<INDEX_T>(0), key);
         if (old == ~static_cast<INDEX_T>(0))
-        {
             return 1;
-        }
         else if (old == key)
-        {
             return 0;
-        }
         index = (index + stride) & bit_mask;
     }
-  return 0;
+    return 0;
 }
 
 __device__ inline void hashtable_restore
@@ -139,13 +87,12 @@ __device__ inline void hashtable_restore
     if (threadIdx.x < first_tid) return;
     for (unsigned i = threadIdx.x - first_tid; i < itopk_size; i += blockDim.x - first_tid)
     {
-        auto key = itopk_indices[i] & ~index_msb_1_mask;  // clear most significant bit
+        auto key = itopk_indices[i] & ~index_msb_1_mask;
         hashtable_insert(table, BITLEN, key);
     }
 }
 
-
-/////////////////////////////////////////////////////// sort ///////////////////////////////////////////////////////
+/////////////////////////////////////////////////////// sort routines (unchanged) ///////////////////////////////////////////////////////
 
 template <class K, class V>
 __device__ inline void swap_if_needed(K& k0, V& v0, const unsigned lane_offset, const bool asc)
@@ -238,7 +185,6 @@ __device__ inline void warp_merge_core(K k[2], V v[2], const std::uint32_t range
     }
 }
 
-
 template <class K, class V, unsigned N, unsigned warp_size = 32>
 __device__ void warp_merge(K k[N], V v[N], unsigned range, const bool asc = true)
 {
@@ -264,18 +210,15 @@ __device__ void candidate_by_bitonic_sort
     const unsigned lane_id = threadIdx.x % 32;
     const unsigned warp_id = threadIdx.x / 32;
 
-// sort 1
     if (warp_id > 0) { return; }
     if (CANDIDATE_BUFFER_SIZE != 64) 
     {
         printf("CANDIDATE_BUFFER_SIZE must be 64\n");
         assert(false);
     }
-    // constexpr unsigned N_1 = 2;
     DISTANCE_T key_1[N_1];
     INDEX_T val_1[N_1];
 
-    /* Candidates -> Reg */
     for (unsigned i = 0; i < N_1; i++)
     {
         unsigned j = lane_id + (32 * i);
@@ -290,9 +233,7 @@ __device__ void candidate_by_bitonic_sort
             val_1[i] = std::numeric_limits<INDEX_T>::max();
         }
     }
-    /* Sort */
     warp_sort<float, uint32_t, N_1>(key_1, val_1);
-    /* Reg -> Temp_itopk */
     for (unsigned i = 0; i < N_1; i++)
     {
         unsigned j = (N_1 * lane_id) + i;
@@ -314,18 +255,15 @@ __device__ void candidate_by_bitonic_sort_inverse
     const unsigned lane_id = threadIdx.x % 32;
     const unsigned warp_id = threadIdx.x / 32;
 
-// sort 1
     if (warp_id > 0) { return; }
     if (CANDIDATE_BUFFER_SIZE != 64) 
     {
         printf("CANDIDATE_BUFFER_SIZE must be 64\n");
         assert(false);
     }
-    // constexpr unsigned N_1 = 2;
     DISTANCE_T key_1[N_1];
     INDEX_T val_1[N_1];
 
-    /* Candidates -> Reg */
     for (unsigned i = 0; i < N_1; i++)
     {
         unsigned j = lane_id + (32 * i);
@@ -340,9 +278,7 @@ __device__ void candidate_by_bitonic_sort_inverse
             val_1[i] = std::numeric_limits<INDEX_T>::max();
         }
     }
-    /* Sort */
     warp_sort<float, uint32_t, N_1>(key_1, val_1);
-    /* Reg -> Temp_itopk */
     for (unsigned i = 0; i < N_1; i++)
     {
         unsigned j = CANDIDATE_BUFFER_SIZE - 1 - ( (N_1 * lane_id) + i );
@@ -367,19 +303,16 @@ __device__ void topk_by_bitonic_sort
     const unsigned lane_id = threadIdx.x % 32;
     const unsigned warp_id = threadIdx.x / 32;
 
-// sort 1
     if (warp_id > 0) { return; }
     if (CANDIDATE_BUFFER_SIZE != 64) 
     {
         printf("CANDIDATE_BUFFER_SIZE must be 64\n");
         assert(false);
     }
-    // constexpr unsigned N_1 = 2;
     DISTANCE_T key_1[N_1];
     INDEX_T val_1[N_1];
     auto candidate_distances = result_distances_ptr + INTERNAL_TOPK;
     auto candidate_indices = result_indices_ptr + INTERNAL_TOPK;
-    /* Candidates -> Reg */
     for (unsigned i = 0; i < N_1; i++)
     {
         unsigned j = lane_id + (32 * i);
@@ -394,9 +327,7 @@ __device__ void topk_by_bitonic_sort
             val_1[i] = std::numeric_limits<INDEX_T>::max();
         }
     }
-    /* Sort */
     warp_sort<float, uint32_t, N_1>(key_1, val_1);
-    /* Reg -> Temp_itopk */
     for (unsigned i = 0; i < N_1; i++)
     {
         unsigned j = (N_1 * lane_id) + i;
@@ -406,12 +337,9 @@ __device__ void topk_by_bitonic_sort
         }
     }
 
-// sort 2
-    // constexpr unsigned N_2 = 4;
     DISTANCE_T key_2[N_2];
     INDEX_T val_2[N_2];
     if (first) {
-      /* Load itopk results */
         for (unsigned i = 0; i < N_2; i++) {
             unsigned j = lane_id + (32 * i);
             if (j < INTERNAL_TOPK) {
@@ -422,12 +350,10 @@ __device__ void topk_by_bitonic_sort
                 val_2[i] = std::numeric_limits<INDEX_T>::max();
             }
         }
-        /* Warp Sort */
         warp_sort<float, uint32_t, N_2>(key_2, val_2);
     }
     else
     {
-        /* Load itopk results */
         for (unsigned i = 0; i < N_2; i++) {
             unsigned j = (N_2 * lane_id) + i;
             if (j < INTERNAL_TOPK) {
@@ -439,9 +365,8 @@ __device__ void topk_by_bitonic_sort
             }
         }
     }
-    /* Merge candidates */
     for (unsigned i = 0; i < N_2; i++) {
-      unsigned j = (N_2 * lane_id) + i;  // [0:MAX_ITOPK-1]
+      unsigned j = (N_2 * lane_id) + i;
       unsigned k = INTERNAL_TOPK - 1 - j;
       if (k >= INTERNAL_TOPK || k >= CANDIDATE_BUFFER_SIZE) continue;
       auto candidate_key = candidate_distances[k];
@@ -450,9 +375,7 @@ __device__ void topk_by_bitonic_sort
         val_2[i] = candidate_indices[k];
       }
     }
-    /* Warp Merge */
     warp_merge<float, uint32_t, N_2>(key_2, val_2, 32);
-    /* Store new itopk results */
     for (unsigned i = 0; i < N_2; i++) {
       unsigned j = (N_2 * lane_id) + i;
       if (j < INTERNAL_TOPK) {
@@ -460,311 +383,60 @@ __device__ void topk_by_bitonic_sort
         result_indices_ptr[j]   = val_2[i];
       }
     }
-
 }
 
-/////////////////////////////////////////////////////// distance calculation ///////////////////////////////////////////////////////
+/////////////////////////////////////////////////////// PQ distance computation ///////////////////////////////////////////////////////
 
-__device__ void pickup_next_parents
+template<uint32_t VECTOR_DIM>
+__device__ DISTANCE_T compute_similarity_pq
 (
-    uint32_t* terminate_flag,
-    INDEX_T* const parent_list_buffer,
-    INDEX_T* const result_indices_buffer,
-    const uint32_t INTERNAL_TOPK,
-    const uint32_t SEARCH_WIDTH
-)
-{
-    constexpr INDEX_T index_msb_1_mask = 0x80000000;
-    // if (threadIdx.x >= 32) return;
-
-    for (std::uint32_t i = threadIdx.x; i < SEARCH_WIDTH; i += 32)
-    {
-        parent_list_buffer[i] = std::numeric_limits<INDEX_T>::max();
-    }
-    std::uint32_t itopk_max = INTERNAL_TOPK;
-    if (itopk_max % 32)
-    {
-        itopk_max += 32 - (itopk_max % 32);
-    }
-    std::uint32_t num_new_parents = 0;
-    
-    for (std::uint32_t j = threadIdx.x; j < itopk_max; j += 32) 
-    {
-        INDEX_T index;
-        int new_parent = 0;
-        if (j < INTERNAL_TOPK)
-        {
-            index = result_indices_buffer[j];
-            if ((index & index_msb_1_mask) == 0)
-            {   // check if most significant bit is set
-                new_parent = 1;
-            }
-        }
-
-        const std::uint32_t ballot_mask = __ballot_sync(0xffffffff, new_parent);
-        if (new_parent)
-        {
-            const auto i = __popc(ballot_mask & ((1 << threadIdx.x) - 1)) + num_new_parents;
-            if (i < SEARCH_WIDTH)
-            {
-                parent_list_buffer[i] = j;
-                // set most significant bit as used node
-                result_indices_buffer[j] |= index_msb_1_mask;
-            }
-        }
-
-        num_new_parents += __popc(ballot_mask);
-        if (num_new_parents >= SEARCH_WIDTH) { break; }
-    }
-    if (threadIdx.x == 0 && (num_new_parents == 0)) { *terminate_flag = 1; }
-
-}
-
-
-template<uint32_t VECTOR_DIM, uint32_t TEAM_SIZE>
-__device__ DISTANCE_T compute_similarity_vector_load_full
-(
-    DATA_T* d_dataset_ptr,
-    DATA_T* query_ptr,
-    INDEX_T child_id,
-    bool valid_child
-)
-{
-    auto child_data_ptr  = d_dataset_ptr + child_id * VECTOR_DIM;
-    unsigned lane_id  = threadIdx.x % TEAM_SIZE;
-
-    constexpr unsigned vlen = 16 / sizeof(DATA_T);  //128bit = 16Byte
-    constexpr unsigned reg_nelem = (VECTOR_DIM + TEAM_SIZE * vlen - 1) / (TEAM_SIZE * vlen);
-    float4 dl_buff[reg_nelem];
-    unsigned int full_mask = 0xffffffff;
-
-
-    DISTANCE_T norm2 = 0;
-
-    if (valid_child)
-    {
-        // Load
-        #pragma unroll
-        for (uint32_t e = 0; e < reg_nelem; e++) 
-        {
-            const uint32_t k = (lane_id + (TEAM_SIZE * e)) * vlen;
-            if (k >= VECTOR_DIM) break;
-            dl_buff[e] = reinterpret_cast<float4*>(child_data_ptr)[k / 4];
-        }
-        
-       // Compute  ←←← 只改这里
-        if (valid_child)
-            norm2 = pq_distance(query_ptr, d_pq_codebook, VECTOR_DIM);
-    }
-
-    unsigned team_mask = __ballot_sync(0xffffffff, valid_child);
-
-    for (uint32_t offset = TEAM_SIZE / 2; offset > 0; offset >>= 1) {
-        norm2 += __shfl_xor_sync(full_mask, norm2, offset);
-    }
-
-    return norm2;
-}
-
-template<uint32_t VECTOR_DIM, uint32_t TEAM_SIZE, uint32_t RATIO = 2>
-__device__ DISTANCE_T compute_similarity_vector_load_partial
-(
-    DATA_T* d_dataset_ptr,
-    DATA_T* query_ptr,
+    uint8_t* d_pq_codes,
     INDEX_T child_id,
     bool valid_child,
-    DISTANCE_T threshold = 9999999999
+    float* dist_table          // shared memory: [PQ_M][PQ_Ks]
 )
 {
-    auto child_data_ptr  = d_dataset_ptr + child_id * VECTOR_DIM;
-    unsigned lane_id  = threadIdx.x % TEAM_SIZE;
-
-    constexpr unsigned vlen = 16 / sizeof(DATA_T);  //128bit = 16Byte, vlen == 4
-    constexpr unsigned reg_nelem = std::max(1U, ((VECTOR_DIM + TEAM_SIZE * vlen - 1) / (TEAM_SIZE * vlen) + RATIO - 1) / RATIO * (RATIO - 1));
-    float4 dl_buff[reg_nelem];
-    unsigned int full_mask = 0xffffffff;
-
-
-    DISTANCE_T norm2 = 0;
-
-    if (valid_child)
-    {
-        // Load
-        #pragma unroll
-        for (uint32_t e = 0; e < reg_nelem; e++) 
-        {
-            const uint32_t k = (lane_id + (TEAM_SIZE * e)) * vlen;
-            if (k >= VECTOR_DIM) break;
-            dl_buff[e] = reinterpret_cast<float4*>(child_data_ptr)[k / 4];
-        }
-        
-        // Compute
-        #pragma unroll
-        for (uint32_t e = 0; e < reg_nelem; e++) 
-        {
-            const uint32_t k = (lane_id + (TEAM_SIZE * e)) * vlen;
-            if (k >= VECTOR_DIM) break;
-
-            DISTANCE_T d = query_ptr[k];
-            norm2 += (d - dl_buff[e].x) * (d - dl_buff[e].x);
-            d = query_ptr[k + 1];
-            norm2 += (d - dl_buff[e].y) * (d - dl_buff[e].y);
-            d = query_ptr[k + 2];
-            norm2 += (d - dl_buff[e].z) * (d - dl_buff[e].z);
-            d = query_ptr[k + 3];
-            norm2 += (d - dl_buff[e].w) * (d - dl_buff[e].w);
-
-        }
+    DISTANCE_T norm2 = 0.0f;
+    const unsigned lane_id = threadIdx.x % 32;   // we use only first 8 lanes per team
+    if (valid_child && lane_id < PQ_M) {
+        uint8_t code = d_pq_codes[child_id * PQ_M + lane_id];
+        norm2 = dist_table[lane_id * PQ_Ks + code];
     }
-
-    unsigned team_mask = __ballot_sync(0xffffffff, valid_child);
-
-    for (uint32_t offset = TEAM_SIZE / 2; offset > 0; offset >>= 1) {
+    // reduce within warp (only first 8 lanes have meaningful values)
+    unsigned full_mask = 0xffffffff;
+    for (uint32_t offset = PQ_M / 2; offset > 0; offset >>= 1) {
         norm2 += __shfl_xor_sync(full_mask, norm2, offset);
     }
-
     return norm2;
 }
 
+// Batch PQ distance computation for candidate buffer
 template<uint32_t VECTOR_DIM, uint32_t TEAM_SIZE>
-__device__ DISTANCE_T compute_similarity_vector_load_by_team
+__device__ void compute_distance_pq_batch
 (
-    DATA_T* d_dataset_ptr,
-    DATA_T* query_ptr,
-    INDEX_T child_id,
-    unsigned team_mask
+    INDEX_T* candidate_indices_ptr,
+    DISTANCE_T* candidate_distances_ptr,
+    uint8_t* d_pq_codes,
+    float* dist_table,
+    uint32_t CANDIDATE_BUFFER_SIZE
 )
 {
-    auto child_data_ptr  = d_dataset_ptr + child_id * VECTOR_DIM;
-    unsigned lane_id  = threadIdx.x % TEAM_SIZE;
-    unsigned team_id  = threadIdx.x / TEAM_SIZE;
-
-    constexpr unsigned vlen = 16 / sizeof(DATA_T);  //128bit = 16Byte
-    constexpr unsigned reg_nelem = (VECTOR_DIM + TEAM_SIZE * vlen - 1) / (TEAM_SIZE * vlen);
-    float4 dl_buff[reg_nelem];
-
-    DISTANCE_T norm2 = 0;
-    
-    // Load
-    #pragma unroll
-    for (uint32_t e = 0; e < reg_nelem; e++) 
-    {
-        const uint32_t k = (lane_id + (TEAM_SIZE * e)) * vlen;
-        if (k >= VECTOR_DIM) break;
-        dl_buff[e] = reinterpret_cast<float4*>(child_data_ptr)[k / 4];
+    for (uint32_t tid = threadIdx.x; tid < CANDIDATE_BUFFER_SIZE * TEAM_SIZE; tid += blockDim.x) {
+        const auto i = tid / TEAM_SIZE;
+        const bool valid_i = (i < CANDIDATE_BUFFER_SIZE);
+        INDEX_T child_id = valid_i ? candidate_indices_ptr[i] : std::numeric_limits<INDEX_T>::max();
+        DISTANCE_T norm2 = compute_similarity_pq<VECTOR_DIM>(d_pq_codes, child_id, child_id != std::numeric_limits<INDEX_T>::max(), dist_table);
+        const unsigned lane_id = threadIdx.x % TEAM_SIZE;
+        if (valid_i && lane_id == 0) {
+            candidate_distances_ptr[i] = (child_id == std::numeric_limits<INDEX_T>::max()) ? FLT_MAX : norm2;
+        }
     }
-    
-    // Compute
-    #pragma unroll
-    for (uint32_t e = 0; e < reg_nelem; e++) 
-    {
-        const uint32_t k = (lane_id + (TEAM_SIZE * e)) * vlen;
-        if (k >= VECTOR_DIM) break;
-
-        DISTANCE_T d = query_ptr[k];
-        norm2 += (d - dl_buff[e].x) * (d - dl_buff[e].x);
-        d = query_ptr[k + 1];
-        norm2 += (d - dl_buff[e].y) * (d - dl_buff[e].y);
-        d = query_ptr[k + 2];
-        norm2 += (d - dl_buff[e].z) * (d - dl_buff[e].z);
-        d = query_ptr[k + 3];
-        norm2 += (d - dl_buff[e].w) * (d - dl_buff[e].w);
-
-    }
-
-    for (uint32_t offset = TEAM_SIZE / 2; offset > 0; offset >>= 1) {
-        norm2 += __shfl_xor_sync(team_mask, norm2, offset);
-    }
-
-    return norm2;
 }
 
-template<uint32_t VECTOR_DIM, uint32_t TEAM_SIZE>
-__device__ DISTANCE_T compute_similarity_vector_load_by_team_partial_float4
-(
-    DATA_T* d_dataset_ptr,
-    DATA_T* query_ptr,
-    INDEX_T child_id,
-    unsigned team_mask,
-    uint32_t e
-)
-{
+/////////////////////////////////////////////////////// helpers for seed initialization ///////////////////////////////////////////////////////
 
-    auto child_data_ptr  = d_dataset_ptr + child_id * VECTOR_DIM;
-    unsigned lane_id  = threadIdx.x % TEAM_SIZE;
-
-    constexpr unsigned vlen = 16 / sizeof(DATA_T);  //128bit = 16Byte
-    // constexpr unsigned reg_nelem = (VECTOR_DIM + TEAM_SIZE * vlen - 1) / (TEAM_SIZE * vlen);
-    float4 dl_buff;
-
-    DISTANCE_T norm2 = 0;
-    
-    const uint32_t k = (lane_id + (TEAM_SIZE * e)) * vlen;
-    if (k < VECTOR_DIM)
-    {
-        // Load
-        dl_buff = reinterpret_cast<float4*>(child_data_ptr)[k / 4];
-        // Compute
-        DISTANCE_T d = query_ptr[k];
-        norm2 += (d - dl_buff.x) * (d - dl_buff.x);
-        d = query_ptr[k + 1];
-        norm2 += (d - dl_buff.y) * (d - dl_buff.y);
-        d = query_ptr[k + 2];
-        norm2 += (d - dl_buff.z) * (d - dl_buff.z);
-        d = query_ptr[k + 3];
-        norm2 += (d - dl_buff.w) * (d - dl_buff.w);
-    }
-
-    // Reduce
-    for (uint32_t offset = TEAM_SIZE / 2; offset > 0; offset >>= 1) {
-        norm2 += __shfl_xor_sync(team_mask, norm2, offset);
-    }
-
-    return norm2;
-}
-
-template<uint32_t VECTOR_DIM, uint32_t TEAM_SIZE>
-__device__ DISTANCE_T compute_similarity_vector_load_by_team_partial_float2
-(
-    DATA_T* d_dataset_ptr,
-    DATA_T* query_ptr,
-    INDEX_T child_id,
-    unsigned team_mask,
-    uint32_t e
-)
-{
-
-    auto child_data_ptr  = d_dataset_ptr + child_id * VECTOR_DIM;
-    unsigned lane_id  = threadIdx.x % TEAM_SIZE;
-    unsigned team_id  = threadIdx.x / TEAM_SIZE;
-
-    float2 dl_buff;
-
-    DISTANCE_T norm2 = 0;
-    
-    const uint32_t k = (lane_id + (TEAM_SIZE * e)) * 2;
-    if (k < VECTOR_DIM)
-    {
-        // Load
-        dl_buff = reinterpret_cast<float2*>(child_data_ptr)[k / 2];
-        // Compute
-        DISTANCE_T d = query_ptr[k];
-        norm2 += (d - dl_buff.x) * (d - dl_buff.x);
-        d = query_ptr[k + 1];
-        norm2 += (d - dl_buff.y) * (d - dl_buff.y);
-    }
-
-    // Reduce
-    for (uint32_t offset = TEAM_SIZE / 2; offset > 0; offset >>= 1) {
-        norm2 += __shfl_xor_sync(team_mask, norm2, offset);
-    }
-
-    return norm2;
-}
-
-// map top10 nodes and fetch neighbors and calculate distance
-template<uint32_t VECTOR_DIM, uint32_t TEAM_SIZE>
-__device__ void compute_distance_to_maped_top10_nodes
+template <uint32_t VECTOR_DIM, uint32_t TEAM_SIZE>
+__device__ void compute_distance_to_maped_top10_nodes_pq
 (
     INDEX_T* candidate_indices_ptr,
     DISTANCE_T* candidate_distances_ptr,
@@ -780,77 +452,34 @@ __device__ void compute_distance_to_maped_top10_nodes
     uint32_t BITLEN,
     uint32_t SEED_CONFIG,
     uint32_t HASH_TABLE_CONFIG,
-    uint32_t SEED_TOPK_SIZE
+    uint32_t SEED_TOPK_SIZE,
+    uint8_t* d_pq_codes,
+    float* dist_table
 )
 {
-    const INDEX_T invalid_index        = std::numeric_limits<INDEX_T>::max();
-
-    // Load top N nodes
+    const INDEX_T invalid_index = std::numeric_limits<INDEX_T>::max();
     INDEX_T top1 = top10_ptr[blockIdx.y * SEED_TOPK_SIZE];
-
-    // Map top1 nodes to dataset
     INDEX_T parent_id = seed_map_ptr[top1];
-
-    // fetch neighbors and insert to hash table
-    for (uint32_t i = threadIdx.x; i < CANDIDATE_BUFFER_SIZE; i += blockDim.x)
-    {
+    for (uint32_t i = threadIdx.x; i < CANDIDATE_BUFFER_SIZE; i += blockDim.x) {
         INDEX_T child_id = graph_ptr[(static_cast<int64_t>(GRAPH_DEGREE) * parent_id) + i];
-
-        if (HASH_TABLE_CONFIG)
-        {
-            if (child_id != invalid_index)
-            {
-                if (hashtable_insert(visited_hash_ptr, BITLEN, child_id) == 0)
-                {
+        if (HASH_TABLE_CONFIG) {
+            if (child_id != invalid_index) {
+                if (hashtable_insert(visited_hash_ptr, BITLEN, child_id) == 0) {
                     child_id = invalid_index;
                     candidate_distances_ptr[i] = FLT_MAX;
-                }
-                else
-                {
+                } else {
                     candidate_distances_ptr[i] = 0;
                 }
             }
             candidate_indices_ptr[i] = child_id;
         }
     }
-
     __syncthreads();
-
-    // calculate distance
-    for (std::uint32_t tid = threadIdx.x; tid < CANDIDATE_BUFFER_SIZE * TEAM_SIZE; tid += blockDim.x)
-    {
-        const auto i       = tid / TEAM_SIZE;
-        const bool valid_i = (i < (CANDIDATE_BUFFER_SIZE));
-        INDEX_T child_id   = invalid_index;
-        if (valid_i) { child_id = candidate_indices_ptr[i]; }
-
-        DISTANCE_T norm2 = compute_similarity_vector_load_full<VECTOR_DIM, TEAM_SIZE>
-                                (
-                                    dataset_ptr, 
-                                    query_ptr, 
-                                    child_id, 
-                                    child_id != invalid_index
-                                );
-
-        // Store the distance
-        const unsigned lane_id = threadIdx.x % TEAM_SIZE;
-        if (valid_i && lane_id == 0)
-        {
-            if (child_id != invalid_index)
-            {
-                candidate_distances_ptr[i] = norm2;
-            } 
-            else
-            {
-                candidate_distances_ptr[i] = FLT_MAX;
-            }
-        }
-    }    
-
+    compute_distance_pq_batch<VECTOR_DIM, TEAM_SIZE>(candidate_indices_ptr, candidate_distances_ptr, d_pq_codes, dist_table, CANDIDATE_BUFFER_SIZE);
 }
 
 template <uint32_t VECTOR_DIM, uint32_t TEAM_SIZE>
-__device__ void compute_distance_to_random_nodes
+__device__ void compute_distance_to_random_nodes_pq
 (
     INDEX_T* candidate_indices_ptr,
     DISTANCE_T* candidate_distances_ptr,
@@ -861,63 +490,43 @@ __device__ void compute_distance_to_random_nodes
     uint32_t NUM_DIST,
     INDEX_T* visited_hash_ptr,
     uint32_t BITLEN,
-    uint32_t HASH_TABLE_CONFIG
+    uint32_t HASH_TABLE_CONFIG,
+    uint8_t* d_pq_codes,
+    float* dist_table
 )
-{   
+{
     uint32_t max_i = CANDIDATE_BUFFER_SIZE;
     if (max_i % (32 / TEAM_SIZE)) { max_i += (32 / TEAM_SIZE) - (max_i % (32 / TEAM_SIZE)); }
 
-    for (uint32_t i = threadIdx.x / TEAM_SIZE; i < max_i; i += blockDim.x / TEAM_SIZE)
-    {
+    for (uint32_t i = threadIdx.x / TEAM_SIZE; i < max_i; i += blockDim.x / TEAM_SIZE) {
         const bool valid_i = (i < CANDIDATE_BUFFER_SIZE);
-
         INDEX_T best_index_team_local;
         DISTANCE_T best_norm2_team_local = std::numeric_limits<DISTANCE_T>::max();
-        for (uint32_t j = 0; j < NUM_DIST; j++)
-        {
-            // Select a node randomly and compute the distance to it
+        for (uint32_t j = 0; j < NUM_DIST; j++) {
             INDEX_T seed_index;
-            if (valid_i)
-            {
+            if (valid_i) {
                 uint32_t gid = threadIdx.x + (blockDim.x * (i + (CANDIDATE_BUFFER_SIZE * j)));
                 curandState state;
                 curand_init(clock64(), gid, 0, &state);
                 seed_index = curand_uniform(&state) * DATASET_SIZE;
-                
             }
-
-            DISTANCE_T norm2 = compute_similarity_vector_load_full<VECTOR_DIM, 8>
-                                                (
-                                                    dataset_ptr,
-                                                    query_ptr,
-                                                    seed_index,
-                                                    valid_i
-                                                );
-
+            DISTANCE_T norm2 = compute_similarity_pq<VECTOR_DIM>(d_pq_codes, seed_index, valid_i, dist_table);
             if (valid_i && (norm2 < best_norm2_team_local)) {
                 best_norm2_team_local = norm2;
                 best_index_team_local = seed_index;
             }
         }
-
         const unsigned lane_id = threadIdx.x % TEAM_SIZE;
-        if (valid_i && lane_id == 0)
-        {
-            if (HASH_TABLE_CONFIG)
-            {
-                if (hashtable_insert(visited_hash_ptr, BITLEN, best_index_team_local))
-                {
+        if (valid_i && lane_id == 0) {
+            if (HASH_TABLE_CONFIG) {
+                if (hashtable_insert(visited_hash_ptr, BITLEN, best_index_team_local)) {
                     candidate_distances_ptr[i] = best_norm2_team_local;
                     candidate_indices_ptr[i]   = best_index_team_local;
-                } 
-                else
-                {
+                } else {
                     candidate_distances_ptr[i] = std::numeric_limits<DISTANCE_T>::max();
                     candidate_indices_ptr[i]   = std::numeric_limits<INDEX_T>::max();
                 }
-            }
-            else
-            {
+            } else {
                 candidate_distances_ptr[i] = best_norm2_team_local;
                 candidate_indices_ptr[i]   = best_index_team_local;
             }
@@ -925,8 +534,174 @@ __device__ void compute_distance_to_random_nodes
     }
 }
 
+/////////////////////////////////////////////////////// pick next parents (unchanged) ///////////////////////////////////////////////////////
+
+__device__ void pickup_next_parents
+(
+    uint32_t* terminate_flag,
+    INDEX_T* const parent_list_buffer,
+    INDEX_T* const result_indices_buffer,
+    const uint32_t INTERNAL_TOPK,
+    const uint32_t SEARCH_WIDTH
+)
+{
+    constexpr INDEX_T index_msb_1_mask = 0x80000000;
+    for (std::uint32_t i = threadIdx.x; i < SEARCH_WIDTH; i += 32) {
+        parent_list_buffer[i] = std::numeric_limits<INDEX_T>::max();
+    }
+    std::uint32_t itopk_max = INTERNAL_TOPK;
+    if (itopk_max % 32) { itopk_max += 32 - (itopk_max % 32); }
+    std::uint32_t num_new_parents = 0;
+    
+    for (std::uint32_t j = threadIdx.x; j < itopk_max; j += 32) {
+        INDEX_T index;
+        int new_parent = 0;
+        if (j < INTERNAL_TOPK) {
+            index = result_indices_buffer[j];
+            if ((index & index_msb_1_mask) == 0) {
+                new_parent = 1;
+            }
+        }
+        const std::uint32_t ballot_mask = __ballot_sync(0xffffffff, new_parent);
+        if (new_parent) {
+            const auto i = __popc(ballot_mask & ((1 << threadIdx.x) - 1)) + num_new_parents;
+            if (i < SEARCH_WIDTH) {
+                parent_list_buffer[i] = j;
+                result_indices_buffer[j] |= index_msb_1_mask;
+            }
+        }
+        num_new_parents += __popc(ballot_mask);
+        if (num_new_parents >= SEARCH_WIDTH) { break; }
+    }
+    if (threadIdx.x == 0 && (num_new_parents == 0)) { *terminate_flag = 1; }
+}
+
+/////////////////////////////////////////////////////// direction pruning with fallback ///////////////////////////////////////////////////////
+
 template <uint32_t VECTOR_DIM, uint32_t TEAM_SIZE, uint32_t INTERNAL_TOPK>
-__device__ void compute_distance_to_child_nodes
+__device__ inline void compute_distance_to_child_nodes_team_with_direction_pq
+(
+    INDEX_T* parent_buffer,
+    INDEX_T* internal_topk_list,
+    INDEX_T* candidate_indices_ptr,
+    DISTANCE_T* candidate_distances_ptr,
+    DATA_T* query_ptr,
+    DATA_T* d_dataset_ptr,
+    INDEX_T* d_graph_ptr,
+    uint32_t* d_sign_bit_ptr,
+    uint32_t GRAPH_DEGREE,
+    uint32_t CANDIDATE_BUFFER_SIZE,
+    uint32_t PRUNE_CONFIG,
+    float PRUNE_RATIO,
+    uint8_t* d_pq_codes,
+    float* dist_table
+)
+{
+    constexpr INDEX_T index_msb_1_mask = 0x80000000;
+    const INDEX_T invalid_index = std::numeric_limits<INDEX_T>::max();
+    const INDEX_T smem_parent_id = parent_buffer[0];
+    const auto parent_id = internal_topk_list[smem_parent_id] & ~index_msb_1_mask;
+
+    // Pre-compute sign bits of query relative to parent for SIGN_BIT_PRUNE
+    constexpr uint32_t packed_vector_dim_size = (VECTOR_DIM + 31) / 32;
+    __shared__ int32_t query_sign_bit[packed_vector_dim_size];
+
+    if (PRUNE_CONFIG == SIGN_BIT_PRUNE) {
+        uint32_t VECTOR_DIM_32 = (VECTOR_DIM + 31) & ~31;
+        for (uint32_t i = threadIdx.x; i < VECTOR_DIM_32; i += blockDim.x) {
+            const bool valid_i = i < VECTOR_DIM;
+            uint32_t sign_bit = (query_ptr[i] > d_dataset_ptr[parent_id * VECTOR_DIM + i]) ? 1 : 0;
+            sign_bit <<= (31 - (threadIdx.x % 32));
+            unsigned active = __ballot_sync(0xffffffff, valid_i);
+            __syncwarp(active);
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                sign_bit |= __shfl_xor_sync(0xffffffff, sign_bit, offset);
+            }
+            if (valid_i) {
+                query_sign_bit[i / 32] = sign_bit;
+            }
+            __syncwarp(active);
+        }
+        __syncthreads();
+    }
+
+    // Step 1: compute direction scores for all neighbors
+    for (uint32_t i = threadIdx.x; i < CANDIDATE_BUFFER_SIZE; i += blockDim.x) {
+        INDEX_T child_id = d_graph_ptr[(static_cast<int64_t>(GRAPH_DEGREE) * parent_id) + i];
+        // Remove duplicates already in internal topk
+        for (int32_t k = 0; k < INTERNAL_TOPK; ++k) {
+            INDEX_T topk_id = internal_topk_list[k] & ~index_msb_1_mask;
+            if (child_id == topk_id) {
+                child_id = invalid_index;
+                break;
+            }
+        }
+        candidate_indices_ptr[i] = child_id;
+        float score = -1e9f;
+        if (child_id != invalid_index) {
+            if (PRUNE_CONFIG == SIGN_BIT_PRUNE) {
+                int direction = 0;
+                uint32_t sign_bit_vector_size = VECTOR_DIM * GRAPH_DEGREE / 32; // each row has this many uint32_t
+                for (int j = 0; j < packed_vector_dim_size; ++j) {
+                    direction -= __popcll(query_sign_bit[j] ^ d_sign_bit_ptr[parent_id * sign_bit_vector_size + i * packed_vector_dim_size + j]);
+                }
+                score = static_cast<float>(direction);
+            } else if (PRUNE_CONFIG == RANDOM_PRUNE) {
+                uint32_t gid = threadIdx.x + blockDim.x * i;
+                curandState state;
+                curand_init(clock64(), gid, 0, &state);
+                score = (curand_uniform(&state) - 0.5f) * VECTOR_DIM;
+            }
+        }
+        candidate_distances_ptr[i] = score;
+    }
+    __syncthreads();
+
+    // Step 2: sort by direction score descending (higher score = more promising)
+    candidate_by_bitonic_sort_inverse<2, INTERNAL_TOPK / 32>
+        (candidate_indices_ptr, candidate_distances_ptr, CANDIDATE_BUFFER_SIZE);
+    __syncthreads();
+
+    // Step 3: determine how many nodes to compute exact PQ distance
+    int keep = max(1, static_cast<int>(CANDIDATE_BUFFER_SIZE * PRUNE_RATIO));
+    __shared__ int selected_cnt;
+    if (threadIdx.x == 0) {
+        selected_cnt = 0;
+        for (int i = 0; i < keep; ++i) {
+            if (candidate_indices_ptr[i] != invalid_index) ++selected_cnt;
+        }
+    }
+    __syncthreads();
+
+    const int fallback_threshold = 4;  // if fewer than 4 valid nodes, compute all
+    if (selected_cnt < fallback_threshold) {
+        keep = CANDIDATE_BUFFER_SIZE;
+    }
+
+    // Step 4: compute PQ distance for the kept nodes, set others to FLT_MAX
+    for (uint32_t tid = threadIdx.x; tid < CANDIDATE_BUFFER_SIZE * TEAM_SIZE; tid += blockDim.x) {
+        uint32_t i = tid / TEAM_SIZE;
+        bool compute = (i < keep);
+        INDEX_T child_id = compute ? candidate_indices_ptr[i] : invalid_index;
+        float dist = FLT_MAX;
+        if (compute && child_id != invalid_index) {
+            dist = compute_similarity_pq<VECTOR_DIM>(d_pq_codes, child_id, true, dist_table);
+        }
+        unsigned lane_id = threadIdx.x % TEAM_SIZE;
+        if (lane_id == 0) {
+            if (compute && child_id != invalid_index) {
+                candidate_distances_ptr[i] = dist;
+            } else {
+                candidate_distances_ptr[i] = FLT_MAX;
+            }
+        }
+    }
+    __syncthreads();
+}
+
+// Fallback when direction pruning is not used (compute all neighbors with PQ)
+template <uint32_t VECTOR_DIM, uint32_t TEAM_SIZE, uint32_t INTERNAL_TOPK>
+__device__ void compute_distance_to_child_nodes_pq
 (
     INDEX_T* parent_buffer,
     INDEX_T* candidate_indices_ptr,
@@ -944,378 +719,43 @@ __device__ void compute_distance_to_child_nodes
     uint32_t* counter,
     uint32_t THRESHOLD_CONFIG,
     uint32_t FULL_COMPUTE_RATIO,
-    uint32_t HASH_TABLE_CONFIG
+    uint32_t HASH_TABLE_CONFIG,
+    uint8_t* d_pq_codes,
+    float* dist_table
 )
 {
     constexpr INDEX_T index_msb_1_mask = 0x80000000;
-    const INDEX_T invalid_index        = std::numeric_limits<INDEX_T>::max();
+    const INDEX_T invalid_index = std::numeric_limits<INDEX_T>::max();
 
-    // Read child indices of parents from knn graph and check if the distance
-    // computaiton is necessary.
-    for (uint32_t i = threadIdx.x; i < CANDIDATE_BUFFER_SIZE; i += blockDim.x)
-    {
+    for (uint32_t i = threadIdx.x; i < CANDIDATE_BUFFER_SIZE; i += blockDim.x) {
         const INDEX_T smem_parent_id = parent_buffer[0];
         const auto parent_id = internal_topk_list[smem_parent_id] & ~index_msb_1_mask;
         INDEX_T child_id = d_graph_ptr[(static_cast<int64_t>(GRAPH_DEGREE) * parent_id) + i];
-       
-        if(!HASH_TABLE_CONFIG)
-        {
-            // check with internal topk
-            for (int32_t internal_topk_ptr = 0; internal_topk_ptr < INTERNAL_TOPK; internal_topk_ptr++)
-            {
-                INDEX_T internal_topk_id = internal_topk_list[internal_topk_ptr] & ~index_msb_1_mask;
-                if(child_id == internal_topk_id)
-                {
+        if (!HASH_TABLE_CONFIG) {
+            for (int32_t k = 0; k < INTERNAL_TOPK; ++k) {
+                INDEX_T topk_id = internal_topk_list[k] & ~index_msb_1_mask;
+                if (child_id == topk_id) {
                     child_id = invalid_index;
                     break;
                 }
             }
-            if (child_id != invalid_index)
-            {
-                candidate_distances_ptr[i] = 0;
-            }
             candidate_indices_ptr[i] = child_id;
-        }
-        else
-        {
-            // const INDEX_T smem_parent_id = parent_buffer[i / GRAPH_DEGREE];
-            // INDEX_T child_id             = invalid_index;
-            // if (smem_parent_id != invalid_index)
-            // {
-            //     const auto parent_id = internal_topk_list[smem_parent_id] & ~index_msb_1_mask;
-            //     child_id             = d_graph_ptr[(i % GRAPH_DEGREE) + (static_cast<int64_t>(GRAPH_DEGREE) * parent_id)];
-            // }
-            if (child_id != invalid_index)
-            {
-                if (hashtable_insert(visited_hash_ptr, BITLEN, child_id) == 0)
-                {
+            candidate_distances_ptr[i] = (child_id != invalid_index) ? 0.0f : FLT_MAX;
+        } else {
+            if (child_id != invalid_index) {
+                if (hashtable_insert(visited_hash_ptr, BITLEN, child_id) == 0) {
                     child_id = invalid_index;
                     candidate_distances_ptr[i] = FLT_MAX;
-                }
-                else
-                {
-                    candidate_distances_ptr[i] = 0;
+                } else {
+                    candidate_distances_ptr[i] = 0.0f;
                 }
             }
             candidate_indices_ptr[i] = child_id;
         }
-
     }
-
-    // Compute half of the distance to child nodes
     __syncthreads();
-
-    if (THRESHOLD_CONFIG == NO_THRESHOLD)
-    {
-        std::uint32_t max_i = GRAPH_DEGREE * SEARCH_WIDTH;
-        for (std::uint32_t tid = threadIdx.x; tid < max_i * TEAM_SIZE; tid += blockDim.x)
-        {
-            const auto i       = tid / TEAM_SIZE;
-            const bool valid_i = (i < (GRAPH_DEGREE * SEARCH_WIDTH));
-            INDEX_T child_id   = invalid_index;
-            if (valid_i) { child_id = candidate_indices_ptr[i]; }
-
-            DISTANCE_T norm2 = compute_similarity_vector_load_full<VECTOR_DIM, TEAM_SIZE>
-                                    (
-                                        d_dataset_ptr, 
-                                        query_ptr, 
-                                        child_id, 
-                                        child_id != invalid_index
-                                    );
-
-            // Store the distance
-            const unsigned lane_id = threadIdx.x % TEAM_SIZE;
-            if (valid_i && lane_id == 0)
-            {
-                if (child_id != invalid_index)
-                {
-                    candidate_distances_ptr[i] = norm2;
-                } 
-                else
-                {
-                    candidate_distances_ptr[i] = FLT_MAX;
-                }
-            }
-        }
-
-    }
-    else
-    {
-
-        DISTANCE_T threshold = candidate_distances_ptr[-1];
-        std::uint32_t max_i = GRAPH_DEGREE * SEARCH_WIDTH;
-        for (std::uint32_t tid = threadIdx.x; tid < max_i * TEAM_SIZE; tid += blockDim.x)
-        {
-            const auto i       = tid / TEAM_SIZE;
-            const bool valid_i = (i < (GRAPH_DEGREE * SEARCH_WIDTH));
-            INDEX_T child_id   = invalid_index;
-            if (valid_i) { child_id = candidate_indices_ptr[i]; }
-
-            DISTANCE_T norm2 = compute_similarity_vector_load_partial<VECTOR_DIM, TEAM_SIZE, 4/*compute 75%*/>
-                                    (
-                                        d_dataset_ptr, 
-                                        query_ptr, 
-                                        child_id, 
-                                        child_id != invalid_index
-                                    );
-
-            // Store the distance
-            const unsigned lane_id = threadIdx.x % TEAM_SIZE;
-            if (valid_i && lane_id == 0)
-            {
-                if (child_id != invalid_index && norm2 < threshold)
-                {
-                    candidate_distances_ptr[i] = norm2;
-                } 
-                else
-                {
-                    candidate_distances_ptr[i] = FLT_MAX;
-                }
-            }
-        }
-
-        // atomic add
-        __syncthreads();
-        const uint32_t _TEAM_SIZE = TEAM_SIZE;
-        uint8_t _lane_id = threadIdx.x % _TEAM_SIZE;
-        uint8_t _team_id = threadIdx.x / _TEAM_SIZE;
-        unsigned _team_mask = 0xff << (_team_id * _TEAM_SIZE);
-        uint32_t _offset_e_maxi = ((VECTOR_DIM + _TEAM_SIZE * 4 - 1) / (_TEAM_SIZE * 4) + 4 -1) / 4;
-        uint32_t _max_i = _offset_e_maxi * CANDIDATE_BUFFER_SIZE;
-        // uint32_t _max_i = ((VECTOR_DIM + _TEAM_SIZE * 4 - 1) / (_TEAM_SIZE * 4/*float4*/) + FULL_COMPUTE_RATIO - 1)/ FULL_COMPUTE_RATIO /*75% is alreadly computed*/ * CANDIDATE_BUFFER_SIZE;
-        while(true)
-        {   
-            uint32_t i = 0;
-            if(_lane_id == 0)
-            {
-                while(true)
-                {
-                    i =  atomicAdd(counter, 1);
-                    if(i >= _max_i)
-                    {
-                        break;
-                    }
-                    if(candidate_distances_ptr[i % CANDIDATE_BUFFER_SIZE] != FLT_MAX)
-                    {
-                        break;
-                    }
-                }
-            }
-            i = __shfl_sync(_team_mask, i, _team_id * _TEAM_SIZE);
-            
-            if(i >= _max_i)
-            {
-                break;
-            }
-            
-            uint32_t vector_offset = i / CANDIDATE_BUFFER_SIZE;
-            i = i % CANDIDATE_BUFFER_SIZE;
-     
-            INDEX_T child_id = candidate_indices_ptr[i];
-
-            // Distance calculation
-            uint32_t e = _offset_e_maxi * (4 - 1);
-            // uint32_t e =((VECTOR_DIM + _TEAM_SIZE * 4 - 1) / (_TEAM_SIZE * 4) + FULL_COMPUTE_RATIO -1) / FULL_COMPUTE_RATIO * (FULL_COMPUTE_RATIO -1);
-            DISTANCE_T partial_norm2 = compute_similarity_vector_load_by_team_partial_float4<VECTOR_DIM, _TEAM_SIZE>
-                                        (
-                                            d_dataset_ptr,
-                                            query_ptr,
-                                            child_id,
-                                            _team_mask,
-                                            e + vector_offset               // vector offset
-                                        );
-            
-            if (_lane_id == 0)
-            {
-                DISTANCE_T saved_norm2 = candidate_distances_ptr[i];
-                if(saved_norm2 + partial_norm2 > threshold)
-                {
-                    candidate_distances_ptr[i] = FLT_MAX;
-                }
-                else
-                {
-                    candidate_distances_ptr[i] = saved_norm2 + partial_norm2;
-                }
-            }  
-        }
-
-    }
-
+    compute_distance_pq_batch<VECTOR_DIM, TEAM_SIZE>(candidate_indices_ptr, candidate_distances_ptr, d_pq_codes, dist_table, CANDIDATE_BUFFER_SIZE);
 }
-
-
-template <uint32_t VECTOR_DIM, uint32_t TEAM_SIZE, uint32_t INTERNAL_TOPK>
-__device__ inline void compute_distance_to_child_nodes_team_with_direction
-(
-    INDEX_T* parent_buffer,
-    INDEX_T* internal_topk_list,
-    INDEX_T* candidate_indices_ptr,
-    DISTANCE_T* candidate_distances_ptr,
-    DATA_T* query_ptr,
-    DATA_T* d_dataset_ptr,
-    INDEX_T* d_graph_ptr,
-    uint32_t* d_sign_bit_ptr,
-    uint32_t GRAPH_DEGREE,
-    uint32_t CANDIDATE_BUFFER_SIZE,
-    uint32_t PRUNE_CONFIG,
-    float PRUNE_RATIO
-)
-{
-    constexpr INDEX_T index_msb_1_mask = 0x80000000;
-    const INDEX_T invalid_index        = std::numeric_limits<INDEX_T>::max();
-
-    const INDEX_T smem_parent_id = parent_buffer[0];
-    const auto parent_id = internal_topk_list[smem_parent_id] & ~index_msb_1_mask;
-    
-    int8_t lane_id = threadIdx.x % 32;
-    uint32_t sign_bit_vector_size = VECTOR_DIM * GRAPH_DEGREE / 32; // 256 for sift-128
-    constexpr uint32_t packed_vector_dim_size = (VECTOR_DIM + 31) / 32;
-
-    // uint32_t query_sign_bit[VECTOR_DIM / 32];
-    int32_t query_sign_bit[packed_vector_dim_size];
-
-    uint32_t VECTOR_DIM_32 = (VECTOR_DIM + 31) & ~31;
-    for (uint32_t i = threadIdx.x; i < VECTOR_DIM_32; i += blockDim.x)
-    {
-        const bool valid_i = i < VECTOR_DIM;
-        uint32_t sign_bit = query_ptr[i] > d_dataset_ptr[parent_id * VECTOR_DIM + i];
-
-        sign_bit <<= (31 - lane_id);
-        unsigned active_threads = __ballot_sync(0xffffffff, valid_i);
-        __syncwarp(active_threads);
-
-        for (int offset = 16; offset > 0; offset /= 2) 
-        {
-            sign_bit |= __shfl_xor_sync(0xffffffff, sign_bit, offset);
-        }
-        
-     
-        // query_sign_bit[i / (VECTOR_DIM / 4)] = sign_bit;
-        // query_sign_bit[i / (VECTOR_DIM / packed_vector_dim_size)] = sign_bit;
-        query_sign_bit[i / 32] = sign_bit;
-
-        __syncwarp(active_threads);
-    }
-
-    for (uint32_t i = threadIdx.x; i < CANDIDATE_BUFFER_SIZE; i += blockDim.x)
-    {
-
-        // const auto parent_id = internal_topk_list[smem_parent_id] & ~index_msb_1_mask;
-        INDEX_T child_id = d_graph_ptr[(static_cast<int64_t>(GRAPH_DEGREE) * parent_id) + i];
-        // check with internal topk
-        for (int32_t internal_topk_ptr = 0; internal_topk_ptr < INTERNAL_TOPK; internal_topk_ptr++)
-        {
-            INDEX_T internal_topk_id = internal_topk_list[internal_topk_ptr] & ~index_msb_1_mask;
-            if(child_id == internal_topk_id)
-            {
-                child_id = invalid_index;
-                break;
-            }
-        }
-
-        
-        if (child_id != invalid_index)
-        {
-            if(PRUNE_CONFIG == RANDOM_PRUNE)
-            {
-                uint32_t gid = threadIdx.x + blockDim.x * i;
-                curandState state;
-                curand_init(clock64(), gid, 0, &state);
-                DISTANCE_T direction = (curand_uniform(&state) - 0.5) * VECTOR_DIM;
-                candidate_distances_ptr[i] = direction;
-                
-                // int direction = 0; 
-                // for (int j = 0; j < packed_vector_dim_size; j++)
-                // {
-                //     if (j < (packed_vector_dim_size / 4))
-                //         direction -= __popcll(query_sign_bit[j] ^ d_sign_bit_ptr[parent_id * sign_bit_vector_size + i * packed_vector_dim_size + j]);
-                //     else
-                //         direction = 10;
-                // }
-                // candidate_distances_ptr[i] = static_cast<float>(direction);
-            }
-            else if(PRUNE_CONFIG == SIGN_BIT_PRUNE)
-            {
-                int direction = 0; 
-                for (int j = 0; j < packed_vector_dim_size; j++)
-                {
-                    direction -= __popcll(query_sign_bit[j] ^ d_sign_bit_ptr[parent_id * sign_bit_vector_size + i * packed_vector_dim_size + j]);
-                }
-                candidate_distances_ptr[i] = static_cast<float>(direction);
-            }
-    
-        }
-        else
-        {
-            candidate_distances_ptr[i] = -99999999.0;
-        }
-        candidate_indices_ptr[i] = child_id;
-
-    }
-
-    __syncwarp(0xffffffff);
-
-    // sort
-        // ===== 方向排序：得分越高越像查询方向 =====
-    candidate_by_bitonic_sort_inverse<2, INTERNAL_TOPK / 32>
-        (
-            candidate_indices_ptr,
-            candidate_distances_ptr,
-            CANDIDATE_BUFFER_SIZE
-        );
-
-    __syncwarp(0xffffffff);
-
-    // ---- Fallback：方向筛太狠时回退 ----
-    const INDEX_T invalid_index = std::numeric_limits<INDEX_T>::max();
-    __shared__ int selected_cnt;                 // 前 PRUNE_RATIO 里有效节点数
-    if (threadIdx.x == 0) {
-        selected_cnt = 0;
-        const int limit = CANDIDATE_BUFFER_SIZE * PRUNE_RATIO;
-        for (int i = 0; i < limit; ++i)
-            if (candidate_indices_ptr[i] != invalid_index) ++selected_cnt;
-    }
-    __syncthreads();
-
-    const int n_fallback = 4;                    // 硬编码阈值，后续可改参数
-    if (selected_cnt < n_fallback) {
-        // 把被筛掉的邻居重新标记为“待算距离”
-        for (int i = threadIdx.x; i < CANDIDATE_BUFFER_SIZE; i += blockDim.x)
-            if (candidate_distances_ptr[i] == -99999999.0f)   // 方向淘汰标记
-                candidate_distances_ptr[i] = 0.0f;            // 0 表示后面会算 L2
-    }
-    __syncthreads();
-
-    // ===== 正常距离计算（前 PRUNE_RATIO 行） =====
-    uint32_t max_tid = CANDIDATE_BUFFER_SIZE * TEAM_SIZE * PRUNE_RATIO
-                     + CANDIDATE_BUFFER_SIZE
-                     - CANDIDATE_BUFFER_SIZE * PRUNE_RATIO;
-    for (uint32_t tid = threadIdx.x; tid < max_tid; tid += blockDim.x) {
-        if (tid < CANDIDATE_BUFFER_SIZE * TEAM_SIZE * PRUNE_RATIO) {
-            uint32_t i = tid / TEAM_SIZE;
-            INDEX_T child_id = candidate_indices_ptr[i];
-
-            DISTANCE_T norm2 = compute_similarity_vector_load_full<VECTOR_DIM, TEAM_SIZE>
-                                        (
-                                            d_dataset_ptr,
-                                            query_ptr,
-                                            child_id,
-                                            child_id != invalid_index
-                                        );
-
-            uint8_t lane_id = threadIdx.x % TEAM_SIZE;
-            if (lane_id == 0) {
-                if (child_id != invalid_index)
-                    candidate_distances_ptr[i] = norm2;
-                else
-                    candidate_distances_ptr[i] = std::numeric_limits<DISTANCE_T>::max();
-            }
-        } else {
-            uint32_t i = tid - CANDIDATE_BUFFER_SIZE * TEAM_SIZE * PRUNE_RATIO
-                         + CANDIDATE_BUFFER_SIZE * PRUNE_RATIO;
-            candidate_distances_ptr[i] = std::numeric_limits<DISTANCE_T>::max();
-        }
-    }
 
 /////////////////////////////////////////////////////// main search kernel ///////////////////////////////////////////////////////
 
@@ -1350,90 +790,72 @@ __global__ void search_kernel
     uint32_t SEED_CONFIG,
     uint32_t HASH_TABLE_CONFIG,
     uint32_t SEED_TOPK_SIZE,
-    float* d_pq_codebook   // 新增 PQ 码本指针
+    float* d_pq_codebook,
+    uint8_t* d_pq_codes
 )
 {
+    static_assert(VECTOR_DIM % PQ_M == 0, "VECTOR_DIM must be multiple of PQ_M");
+    constexpr int dsub = VECTOR_DIM / PQ_M;
 
-    if(TEAM_SIZE != 8)
-    {
-        printf("Invalid TEAM_SIZE\n");
+    if (TEAM_SIZE != 8) {
+        printf("TEAM_SIZE must be 8 for PQ mode\n");
         assert(false);
     }
 
-#ifdef _CLK_BREAKDOWN
-  std::uint64_t clk_init                 = 0;
-  std::uint64_t clk_compute_1st_distance = 0;
-  std::uint64_t clk_sort                 = 0;
-  std::uint64_t clk_reset_hash           = 0;
-  std::uint64_t clk_pickup_parents       = 0;
-  std::uint64_t clk_restore_hash         = 0;
-  std::uint64_t clk_compute_distance     = 0;
-  std::uint64_t clk_start;
-#define _CLK_START() clk_start = clock64()
-#define _CLK_REC(V)  V += clock64() - clk_start;
-#else
-#define _CLK_START()
-#define _CLK_REC(V)
-#endif
-
-    _CLK_START();
     const uint32_t query_id = blockIdx.y;
 
-    // Shared memory initialization
     extern __shared__ uint32_t smem[];
-
     uint32_t RESULT_BUFFER_SIZE = INTERNAL_TOPK + SEARCH_WIDTH * GRAPH_DEGREE;
     uint32_t CANDIDATE_BUFFER_SIZE = SEARCH_WIDTH * GRAPH_DEGREE;
     uint32_t QUERY_BUFFER_SIZE = VECTOR_DIM;
-
     uint32_t hash_table_size = 1 << BITLEN;
 
-    // buffer
+    // Shared memory layout
     auto query_buffer = reinterpret_cast<DATA_T*>(smem);
     auto result_indices_buffer = reinterpret_cast<INDEX_T*>(query_buffer + QUERY_BUFFER_SIZE);
     auto result_distances_buffer = reinterpret_cast<DISTANCE_T*>(result_indices_buffer + RESULT_BUFFER_SIZE);
     auto visited_hash_buffer = reinterpret_cast<INDEX_T*>(result_distances_buffer + RESULT_BUFFER_SIZE);
     auto parent_list_buffer = reinterpret_cast<INDEX_T*>(visited_hash_buffer + hash_table_size);
     auto terminate_flag = reinterpret_cast<uint32_t*>(parent_list_buffer + SEARCH_WIDTH);
-    // flags
     terminate_flag[0] = 0;
-    // counter
     auto counter = reinterpret_cast<uint32_t*>(terminate_flag + 1);
-    
-    if(HASH_TABLE_CONFIG)
-    {
-        // Hash table initialization
+    // dist_table placed after counter, ensure alignment (float)
+    float* dist_table = reinterpret_cast<float*>(counter + 1);
+
+    if (HASH_TABLE_CONFIG) {
         hashtable_init(visited_hash_buffer, BITLEN);
     }
 
-    // Load query
-    for (uint32_t i = threadIdx.x; i < VECTOR_DIM; i += blockDim.x)
-    {   
-        if (i < VECTOR_DIM)
-        {
-            query_buffer[i] = d_queries_ptr[query_id * VECTOR_DIM + i];
-        }
+    // Load query vector
+    for (uint32_t i = threadIdx.x; i < VECTOR_DIM; i += blockDim.x) {
+        query_buffer[i] = d_queries_ptr[query_id * VECTOR_DIM + i];
     }
 
-    // Initialize result buffer
-    for (uint32_t i = threadIdx.x; i < RESULT_BUFFER_SIZE; i += blockDim.x)
-    {
-        if (i < RESULT_BUFFER_SIZE)
-        {
-            result_indices_buffer[i] = std::numeric_limits<INDEX_T>::max();
-            result_distances_buffer[i] = std::numeric_limits<DISTANCE_T>::max();
+    // Build PQ distance lookup table for this query (shared memory)
+    const int total_dist_entries = PQ_M * PQ_Ks;
+    for (int idx = threadIdx.x; idx < total_dist_entries; idx += blockDim.x) {
+        int m = idx / PQ_Ks;
+        int ks = idx % PQ_Ks;
+        const float* center = d_pq_codebook + m * PQ_Ks * dsub + ks * dsub;
+        float dist = 0.0f;
+        for (int d = 0; d < dsub; ++d) {
+            float diff = query_buffer[m * dsub + d] - center[d];
+            dist += diff * diff;
         }
+        dist_table[m * PQ_Ks + ks] = dist;
     }
-
     __syncthreads();
-    _CLK_REC(clk_init);
 
-    _CLK_START();
+    // Initialize result buffers
+    for (uint32_t i = threadIdx.x; i < RESULT_BUFFER_SIZE; i += blockDim.x) {
+        result_indices_buffer[i] = std::numeric_limits<INDEX_T>::max();
+        result_distances_buffer[i] = std::numeric_limits<DISTANCE_T>::max();
+    }
+    __syncthreads();
 
-    if (SEED_CONFIG == NO_SEED)
-    {
-        // Compute distance to randomly selecting nodes
-        compute_distance_to_random_nodes<VECTOR_DIM, 8>
+    // Seed initialization
+    if (SEED_CONFIG == NO_SEED) {
+        compute_distance_to_random_nodes_pq<VECTOR_DIM, 8>
         (
             result_indices_buffer + INTERNAL_TOPK,
             result_distances_buffer + INTERNAL_TOPK,
@@ -1444,13 +866,12 @@ __global__ void search_kernel
             NUM_DIST,
             visited_hash_buffer,
             BITLEN,
-            HASH_TABLE_CONFIG
+            HASH_TABLE_CONFIG,
+            d_pq_codes,
+            dist_table
         );
-    }
-    else
-    {
-        // map top1 nodes and fetch neighbors and calculate distance
-        compute_distance_to_maped_top10_nodes<VECTOR_DIM, 8>
+    } else {
+        compute_distance_to_maped_top10_nodes_pq<VECTOR_DIM, 8>
         (
             result_indices_buffer + INTERNAL_TOPK,
             result_distances_buffer + INTERNAL_TOPK,
@@ -1466,29 +887,21 @@ __global__ void search_kernel
             BITLEN,
             SEED_CONFIG,
             HASH_TABLE_CONFIG,
-            SEED_TOPK_SIZE
+            SEED_TOPK_SIZE,
+            d_pq_codes,
+            dist_table
         );
     }
     __syncthreads();
-    _CLK_REC(clk_compute_1st_distance);
 
     uint32_t iter = 0;
-    while (1)
-    {
-        
-        if(HASH_TABLE_CONFIG)
-        {
-            _CLK_START();
-            if ((iter + 1) % SMALL_HASH_RESET_INTERVAL == 0)
-            {
-                hashtable_init(visited_hash_buffer, BITLEN);
-            }
+    while (1) {
+        if (HASH_TABLE_CONFIG && (iter + 1) % SMALL_HASH_RESET_INTERVAL == 0) {
+            hashtable_init(visited_hash_buffer, BITLEN);
             __syncthreads();
-            _CLK_REC(clk_reset_hash);
         }
 
-        // Sort
-        _CLK_START();
+        // Sort internal topk and merge candidates
         topk_by_bitonic_sort<2, INTERNAL_TOPK / 32>
             (
                 result_indices_buffer,
@@ -1498,19 +911,12 @@ __global__ void search_kernel
                 INTERNAL_TOPK,
                 (iter == 0)
             );
-
         __syncthreads();
-        _CLK_REC(clk_sort);
 
-        if(iter + 1 == MAX_ITER)
-        {
-            break;
-        }
+        if (iter + 1 == MAX_ITER) break;
 
-        // Pick up next parents
-        if (threadIdx.x < 32)
-        {
-            _CLK_START();
+        // Pick next parents
+        if (threadIdx.x < 32) {
             pickup_next_parents
                 (
                     terminate_flag,
@@ -1519,45 +925,26 @@ __global__ void search_kernel
                     INTERNAL_TOPK,
                     SEARCH_WIDTH
                 );
-            _CLK_REC(clk_pickup_parents);
         }
-        
 
-        if(HASH_TABLE_CONFIG)
-        {
-            // Restore hash table by putting internal-topk indices in it
-            _CLK_START();
-            if ((iter + 1) % SMALL_HASH_RESET_INTERVAL == 0)
-            {
-                const unsigned first_tid = ((blockDim.x <= 32) ? 0 : 32);
-                hashtable_restore
-                    (
-                        visited_hash_buffer,
-                        BITLEN,
-                        result_indices_buffer,
-                        INTERNAL_TOPK,
-                        first_tid
-                    );
-            }
+        if (HASH_TABLE_CONFIG && (iter + 1) % SMALL_HASH_RESET_INTERVAL == 0) {
+            const unsigned first_tid = ((blockDim.x <= 32) ? 0 : 32);
+            hashtable_restore
+                (
+                    visited_hash_buffer,
+                    BITLEN,
+                    result_indices_buffer,
+                    INTERNAL_TOPK,
+                    first_tid
+                );
             __syncthreads();
-            _CLK_REC(clk_restore_hash);
         }
 
-        if (*terminate_flag && iter >= MIN_ITER)
-        {
-            break;
-        }
+        if (*terminate_flag && iter >= MIN_ITER) break;
 
-        // Compute distance to child nodes and query node
-        _CLK_START();
-        if (threadIdx.x == 0) {
-            counter[0] = 0;
-        }
-        __syncthreads();
-
-        if (PRUNE_CONFIG != NO_PRUNE && iter < MAX_ITER * ITERATION_DIRECTION_RATIO)
-        {
-            compute_distance_to_child_nodes_team_with_direction<VECTOR_DIM, 8, INTERNAL_TOPK>
+        // Compute distances to child nodes (with or without direction pruning)
+        if (PRUNE_CONFIG != NO_PRUNE && iter < MAX_ITER * ITERATION_DIRECTION_RATIO) {
+            compute_distance_to_child_nodes_team_with_direction_pq<VECTOR_DIM, 8, INTERNAL_TOPK>
             (
                 parent_list_buffer,
                 result_indices_buffer,
@@ -1570,12 +957,12 @@ __global__ void search_kernel
                 GRAPH_DEGREE,
                 CANDIDATE_BUFFER_SIZE,
                 PRUNE_CONFIG,
-                PRUNE_RATIO
+                PRUNE_RATIO,
+                d_pq_codes,
+                dist_table
             );
-        }
-        else
-        {
-            compute_distance_to_child_nodes<VECTOR_DIM, 8, INTERNAL_TOPK>
+        } else {
+            compute_distance_to_child_nodes_pq<VECTOR_DIM, 8, INTERNAL_TOPK>
             (
                 parent_list_buffer,
                 result_indices_buffer + INTERNAL_TOPK,
@@ -1593,17 +980,16 @@ __global__ void search_kernel
                 counter,
                 THRESHOLD_CONFIG,
                 FULL_COMPUTE_RATIO,
-                HASH_TABLE_CONFIG
-            );  
+                HASH_TABLE_CONFIG,
+                d_pq_codes,
+                dist_table
+            );
         }
-
         __syncthreads();
-        _CLK_REC(clk_compute_distance);
-
         iter++;
     }
 
-    // Sorting
+    // Final sort
     topk_by_bitonic_sort<2, INTERNAL_TOPK / 32>
             (
                 result_indices_buffer,
@@ -1616,37 +1002,13 @@ __global__ void search_kernel
     __syncthreads();
 
     // Write results
-    for (uint32_t i = threadIdx.x; i < TOPK; i += blockDim.x)
-    {
+    for (uint32_t i = threadIdx.x; i < TOPK; i += blockDim.x) {
         d_results_ptr[query_id * TOPK + i] = result_indices_buffer[i] & ~0x80000000;
         d_distances_ptr[query_id * TOPK + i] = result_distances_buffer[i];
     }
-
-    #ifdef _CLK_BREAKDOWN
-    if (threadIdx.x == 0 && query_id == 0)
-    {
-        printf(
-        "query, %d, thread, %d"
-        ", init, %lu"
-        ", 1st_distance, %lu"
-        ", topk, %lu"
-        ", reset_hash, %lu"
-        ", pickup_parents, %lu"
-        ", restore_hash, %lu"
-        ", distance, %lu"
-        "\n",
-        query_id,
-        threadIdx.x,
-        clk_init,
-        clk_compute_1st_distance,
-        clk_sort,
-        clk_reset_hash,
-        clk_pickup_parents,
-        clk_restore_hash,
-        clk_compute_distance);
-    }
-    #endif
 }
+
+/////////////////////////////////////////////////////// Host interface ///////////////////////////////////////////////////////
 
 torch::Tensor search(
     torch::Tensor graph, 
@@ -1656,60 +1018,17 @@ torch::Tensor search(
     torch::Tensor seed_map,
     torch::Tensor sign_bit, 
     torch::Tensor configs,
-    torch::Tensor results_distances
+    torch::Tensor results_distances,
+    torch::Tensor pq_codebook,
+    torch::Tensor pq_codes
 ) 
 {
-    // ===== 1. 动态选表 =====
-    std::vector<torch::Tensor> sign_bit_tables(8);
-    torch::Tensor centers = torch::from_numpy(
-        np.load("/root/autodl-tmp/PathWeaver/_datasets/sift-128-euclidean/query_cluster_centers.npy")
-    ).cuda();
-    for (int c = 0; c < 8; ++c) {
-        sign_bit_tables[c] = torch::from_numpy(
-            np.load(f"/root/autodl-tmp/PathWeaver/_datasets/sift-128-euclidean/sign_bit_table_c{c}.npy")
-        ).cuda();
+    if (!graph.is_cuda() || !dataset.is_cuda() || !queries.is_cuda() ||
+        !top10.is_cuda() || !seed_map.is_cuda() || !sign_bit.is_cuda() ||
+        !configs.is_cuda() || !pq_codebook.is_cuda() || !pq_codes.is_cuda()) {
+        throw std::runtime_error("All input tensors must be on GPU.");
     }
-    // 用第 0 条查询当代表（batch 内统一选表）
-    torch::Tensor query_batch = queries.slice(0, 0, 1);   // [1, dim]
-    torch::Tensor dists = torch::sum((query_batch - centers).pow(2), 1);  // [C]
-    int64_t cluster_id = dists.argmin().item<int64_t>();
-    torch::Tensor sign_bit = sign_bit_tables[cluster_id];   // 覆盖原参数
 
-    // ===== 2. PQ 码本 =====
-    torch::Tensor pq_codebook = torch::from_numpy(
-        np.load("/autodl-tmp/PathWeaver/_datasets/sift-128-euclidean/pq_codebook.npy")
-    ).cuda();
-    float* d_pq_codebook = pq_codebook.data_ptr<float>();
-
-    if (!graph.is_cuda())
-    {
-        throw std::runtime_error("Input tensor 'graph' must be on GPU.");
-    }
-    if (!dataset.is_cuda())
-    {
-        throw std::runtime_error("Input tensor 'dataset' must be on GPU.");
-    }
-    if (!queries.is_cuda())
-    {
-        throw std::runtime_error("Input tensor 'queries' must be on GPU.");
-    }
-    if (!top10.is_cuda())
-    {
-        throw std::runtime_error("Input tensor 'top10' must be on GPU.");
-    }
-    if (!seed_map.is_cuda())
-    {
-        throw std::runtime_error("Input tensor 'seed_map' must be on GPU.");
-    }
-    if (!sign_bit.is_cuda())
-    {
-        throw std::runtime_error("Input tensor 'sign_bit' must be on GPU.");
-    }
-    if (!configs.is_cuda())
-    {
-        throw std::runtime_error("Input tensor 'configs' must be on GPU.");
-    }
-    
     uint32_t NUM_QUERIES = configs[0].item<int>();
     uint32_t TOPK = configs[1].item<int>();
     uint32_t SEARCH_WIDTH = configs[2].item<int>();
@@ -1725,28 +1044,17 @@ torch::Tensor search(
     uint32_t BITLEN = configs[12].item<int>();
     uint32_t SMALL_HASH_RESET_INTERVAL = configs[13].item<int>();
     uint32_t SHARED_MEM_SIZE = configs[14].item<int>();
-    // DIRECTION
-    uint32_t PRUNE_CONFIG = configs[15].item<int>(); 
+    uint32_t PRUNE_CONFIG = configs[15].item<int>();
     float ITERATION_DIRECTION_RATIO = configs[16].item<float>();
     float PRUNE_RATIO = configs[17].item<float>();
-    // THRESHOLD
     uint32_t THRESHOLD_CONFIG = configs[18].item<int>();
     uint32_t FULL_COMPUTE_RATIO = configs[19].item<int>();
-    // SEED
     uint32_t SEED_CONFIG = configs[20].item<int>();
-    // HASH TABLE
     uint32_t HASH_TABLE_CONFIG = configs[21].item<int>();
-    // SEED_COUPLING
-    uint32_t SEED_TOPK_SIZE;
-    try {
-        SEED_TOPK_SIZE = configs[22].item<int>();
-    } catch (const std::exception& e) {
-        SEED_TOPK_SIZE = 1;
-    }
+    uint32_t SEED_TOPK_SIZE = (configs.size(0) > 22) ? configs[22].item<int>() : 1;
 
     torch::Tensor results_indices = torch::zeros({NUM_QUERIES, TOPK}, torch::device(queries.device()).dtype(torch::kUInt32));
 
-    // pointer
     INDEX_T* d_graph_ptr = graph.data_ptr<INDEX_T>();
     DATA_T* d_dataset_ptr = dataset.data_ptr<DATA_T>();
     DATA_T* d_queries_ptr = queries.data_ptr<DATA_T>();
@@ -1755,482 +1063,45 @@ torch::Tensor search(
     uint32_t* d_sign_bit_ptr = sign_bit.data_ptr<uint32_t>();
     INDEX_T* d_results_indices_ptr = results_indices.data_ptr<INDEX_T>();
     DISTANCE_T* d_results_distances_ptr = results_distances.data_ptr<DISTANCE_T>();
-
-    // Calculate shaerd mem size
-    uint32_t shared_size = SHARED_MEM_SIZE;
+    float* d_pq_codebook_ptr = pq_codebook.data_ptr<float>();
+    uint8_t* d_pq_codes_ptr = pq_codes.data_ptr<uint8_t>();
 
     dim3 thread_dims(BLOCK_SIZE, 1, 1);
     dim3 block_dims(1, NUM_QUERIES, 1);
-    
-    switch (VECTOR_DIM)
-    {
-        case 128:
-            // sift-128-euclidean
-            if(INTERNAL_TOPK == 64)
-            {
-                search_kernel<128, 64><<<block_dims, thread_dims, shared_size>>>
-                (
-                    d_graph_ptr,
-                    d_dataset_ptr,
-                    d_queries_ptr,
-                    d_top10_ptr,
-                    d_seed_map_ptr,
-                    d_sign_bit_ptr,
-                    d_results_indices_ptr,
-                    d_results_distances_ptr,
-                    NUM_QUERIES,
-                    TOPK,
-                    SEARCH_WIDTH,
-                    MAX_ITER,
-                    MIN_ITER,
-                    DATASET_SIZE,
-                    TEAM_SIZE,
-                    GRAPH_DEGREE,
-                    NUM_DIST,
-                    BLOCK_SIZE,
-                    BITLEN,
-                    SMALL_HASH_RESET_INTERVAL,
-                    PRUNE_CONFIG,
-                    ITERATION_DIRECTION_RATIO,
-                    PRUNE_RATIO,
-                    THRESHOLD_CONFIG,
-                    FULL_COMPUTE_RATIO,
-                    SEED_CONFIG,
-                    HASH_TABLE_CONFIG,
-                    SEED_TOPK_SIZE,
-		    d_pq_codebook   // 新增 PQ 码本指针
-                );
-            }
-            else if(INTERNAL_TOPK == 128)
-            {
-                search_kernel<128, 128><<<block_dims, thread_dims, shared_size>>>
-                (
-                    d_graph_ptr,
-                    d_dataset_ptr,
-                    d_queries_ptr,
-                    d_top10_ptr,
-                    d_seed_map_ptr,
-                    d_sign_bit_ptr,
-                    d_results_indices_ptr,
-                    d_results_distances_ptr,
-                    NUM_QUERIES,
-                    TOPK,
-                    SEARCH_WIDTH,
-                    MAX_ITER,
-                    MIN_ITER,
-                    DATASET_SIZE,
-                    TEAM_SIZE,
-                    GRAPH_DEGREE,
-                    NUM_DIST,
-                    BLOCK_SIZE,
-                    BITLEN,
-                    SMALL_HASH_RESET_INTERVAL,
-                    PRUNE_CONFIG,
-                    ITERATION_DIRECTION_RATIO,
-                    PRUNE_RATIO,
-                    THRESHOLD_CONFIG,
-                    FULL_COMPUTE_RATIO,
-                    SEED_CONFIG,
-                    HASH_TABLE_CONFIG,
-                    SEED_TOPK_SIZE
-                );
-            }
-            else
-            {
-                printf("Invalid INTERNAL_TOPK\n");
-                assert(false);
-            }
-            break;
-        case 960:
-            // gist-960-euclidean
-            if(INTERNAL_TOPK == 64)
-            {
-                search_kernel<960, 64><<<block_dims, thread_dims, shared_size>>>
-                (
-                    d_graph_ptr,
-                    d_dataset_ptr,
-                    d_queries_ptr,
-                    d_top10_ptr,
-                    d_seed_map_ptr,
-                    d_sign_bit_ptr,
-                    d_results_indices_ptr,
-                    d_results_distances_ptr,
-                    NUM_QUERIES,
-                    TOPK,
-                    SEARCH_WIDTH,
-                    MAX_ITER,
-                    MIN_ITER,
-                    DATASET_SIZE,
-                    TEAM_SIZE,
-                    GRAPH_DEGREE,
-                    NUM_DIST,
-                    BLOCK_SIZE,
-                    BITLEN,
-                    SMALL_HASH_RESET_INTERVAL,
-                    PRUNE_CONFIG,
-                    ITERATION_DIRECTION_RATIO,
-                    PRUNE_RATIO,
-                    THRESHOLD_CONFIG,
-                    FULL_COMPUTE_RATIO,
-                    SEED_CONFIG,
-                    HASH_TABLE_CONFIG,
-                    SEED_TOPK_SIZE
-                );
-            }
-            else if(INTERNAL_TOPK == 128)
-            {
-                search_kernel<960, 128><<<block_dims, thread_dims, shared_size>>>
-                (
-                    d_graph_ptr,
-                    d_dataset_ptr,
-                    d_queries_ptr,
-                    d_top10_ptr,
-                    d_seed_map_ptr,
-                    d_sign_bit_ptr,
-                    d_results_indices_ptr,
-                    d_results_distances_ptr,
-                    NUM_QUERIES,
-                    TOPK,
-                    SEARCH_WIDTH,
-                    MAX_ITER,
-                    MIN_ITER,
-                    DATASET_SIZE,
-                    TEAM_SIZE,
-                    GRAPH_DEGREE,
-                    NUM_DIST,
-                    BLOCK_SIZE,
-                    BITLEN,
-                    SMALL_HASH_RESET_INTERVAL,
-                    PRUNE_CONFIG,
-                    ITERATION_DIRECTION_RATIO,
-                    PRUNE_RATIO,
-                    THRESHOLD_CONFIG,
-                    FULL_COMPUTE_RATIO,
-                    SEED_CONFIG,
-                    HASH_TABLE_CONFIG,
-                    SEED_TOPK_SIZE
-                );
-            }
-            else
-            {
-                printf("Invalid INTERNAL_TOPK\n");
-                assert(false);
-            }
-            break;
-        case 100:
-            // glove-100-inner            
-            if(INTERNAL_TOPK == 64)
-            {
-                search_kernel<100, 64><<<block_dims, thread_dims, shared_size>>>
-                (
-                    d_graph_ptr,
-                    d_dataset_ptr,
-                    d_queries_ptr,
-                    d_top10_ptr,
-                    d_seed_map_ptr,
-                    d_sign_bit_ptr,
-                    d_results_indices_ptr,
-                    d_results_distances_ptr,
-                    NUM_QUERIES,
-                    TOPK,
-                    SEARCH_WIDTH,
-                    MAX_ITER,
-                    MIN_ITER,
-                    DATASET_SIZE,
-                    TEAM_SIZE,
-                    GRAPH_DEGREE,
-                    NUM_DIST,
-                    BLOCK_SIZE,
-                    BITLEN,
-                    SMALL_HASH_RESET_INTERVAL,
-                    PRUNE_CONFIG,
-                    ITERATION_DIRECTION_RATIO,
-                    PRUNE_RATIO,
-                    THRESHOLD_CONFIG,
-                    FULL_COMPUTE_RATIO,
-                    SEED_CONFIG,
-                    HASH_TABLE_CONFIG,
-                    SEED_TOPK_SIZE
-                );
-            }
-            else if(INTERNAL_TOPK == 128)
-            {
-                search_kernel<100, 128><<<block_dims, thread_dims, shared_size>>>
-                (
-                    d_graph_ptr,
-                    d_dataset_ptr,
-                    d_queries_ptr,
-                    d_top10_ptr,
-                    d_seed_map_ptr,
-                    d_sign_bit_ptr,
-                    d_results_indices_ptr,
-                    d_results_distances_ptr,
-                    NUM_QUERIES,
-                    TOPK,
-                    SEARCH_WIDTH,
-                    MAX_ITER,
-                    MIN_ITER,
-                    DATASET_SIZE,
-                    TEAM_SIZE,
-                    GRAPH_DEGREE,
-                    NUM_DIST,
-                    BLOCK_SIZE,
-                    BITLEN,
-                    SMALL_HASH_RESET_INTERVAL,
-                    PRUNE_CONFIG,
-                    ITERATION_DIRECTION_RATIO,
-                    PRUNE_RATIO,
-                    THRESHOLD_CONFIG,
-                    FULL_COMPUTE_RATIO,
-                    SEED_CONFIG,
-                    HASH_TABLE_CONFIG,
-                    SEED_TOPK_SIZE
-                );
-            }
-            else
-            {
-                printf("Invalid INTERNAL_TOPK\n");
-                assert(false);
-            }
-            break;
-        case 256:
-            // nytimes-256-inner
-            if(INTERNAL_TOPK == 64)
-            {
-                search_kernel<256, 64><<<block_dims, thread_dims, shared_size>>>
-                (
-                    d_graph_ptr,
-                    d_dataset_ptr,
-                    d_queries_ptr,
-                    d_top10_ptr,
-                    d_seed_map_ptr,
-                    d_sign_bit_ptr,
-                    d_results_indices_ptr,
-                    d_results_distances_ptr,
-                    NUM_QUERIES,
-                    TOPK,
-                    SEARCH_WIDTH,
-                    MAX_ITER,
-                    MIN_ITER,
-                    DATASET_SIZE,
-                    TEAM_SIZE,
-                    GRAPH_DEGREE,
-                    NUM_DIST,
-                    BLOCK_SIZE,
-                    BITLEN,
-                    SMALL_HASH_RESET_INTERVAL,
-                    PRUNE_CONFIG,
-                    ITERATION_DIRECTION_RATIO,
-                    PRUNE_RATIO,
-                    THRESHOLD_CONFIG,
-                    FULL_COMPUTE_RATIO,
-                    SEED_CONFIG,
-                    HASH_TABLE_CONFIG,
-                    SEED_TOPK_SIZE
-                );
-            }
-            else if(INTERNAL_TOPK == 128)
-            {
-                search_kernel<256, 128><<<block_dims, thread_dims, shared_size>>>
-                (
-                    d_graph_ptr,
-                    d_dataset_ptr,
-                    d_queries_ptr,
-                    d_top10_ptr,
-                    d_seed_map_ptr,
-                    d_sign_bit_ptr,
-                    d_results_indices_ptr,
-                    d_results_distances_ptr,
-                    NUM_QUERIES,
-                    TOPK,
-                    SEARCH_WIDTH,
-                    MAX_ITER,
-                    MIN_ITER,
-                    DATASET_SIZE,
-                    TEAM_SIZE,
-                    GRAPH_DEGREE,
-                    NUM_DIST,
-                    BLOCK_SIZE,
-                    BITLEN,
-                    SMALL_HASH_RESET_INTERVAL,
-                    PRUNE_CONFIG,
-                    ITERATION_DIRECTION_RATIO,
-                    PRUNE_RATIO,
-                    THRESHOLD_CONFIG,
-                    FULL_COMPUTE_RATIO,
-                    SEED_CONFIG,
-                    HASH_TABLE_CONFIG,
-                    SEED_TOPK_SIZE
-                );
-            }
-            else
-            {
-                printf("Invalid INTERNAL_TOPK\n");
-                assert(false);
-            }
-            break;
-        case 96:
-            // deep-image-96-inner
-            if(INTERNAL_TOPK == 64)
-            {
-                search_kernel<96, 64><<<block_dims, thread_dims, shared_size>>>
-                (
-                    d_graph_ptr,
-                    d_dataset_ptr,
-                    d_queries_ptr,
-                    d_top10_ptr,
-                    d_seed_map_ptr,
-                    d_sign_bit_ptr,
-                    d_results_indices_ptr,
-                    d_results_distances_ptr,
-                    NUM_QUERIES,
-                    TOPK,
-                    SEARCH_WIDTH,
-                    MAX_ITER,
-                    MIN_ITER,
-                    DATASET_SIZE,
-                    TEAM_SIZE,
-                    GRAPH_DEGREE,
-                    NUM_DIST,
-                    BLOCK_SIZE,
-                    BITLEN,
-                    SMALL_HASH_RESET_INTERVAL,
-                    PRUNE_CONFIG,
-                    ITERATION_DIRECTION_RATIO,
-                    PRUNE_RATIO,
-                    THRESHOLD_CONFIG,
-                    FULL_COMPUTE_RATIO,
-                    SEED_CONFIG,
-                    HASH_TABLE_CONFIG,
-                    SEED_TOPK_SIZE
-                );
-            }
-            else if(INTERNAL_TOPK == 128)
-            {
-                search_kernel<96, 128><<<block_dims, thread_dims, shared_size>>>
-                (
-                    d_graph_ptr,
-                    d_dataset_ptr,
-                    d_queries_ptr,
-                    d_top10_ptr,
-                    d_seed_map_ptr,
-                    d_sign_bit_ptr,
-                    d_results_indices_ptr,
-                    d_results_distances_ptr,
-                    NUM_QUERIES,
-                    TOPK,
-                    SEARCH_WIDTH,
-                    MAX_ITER,
-                    MIN_ITER,
-                    DATASET_SIZE,
-                    TEAM_SIZE,
-                    GRAPH_DEGREE,
-                    NUM_DIST,
-                    BLOCK_SIZE,
-                    BITLEN,
-                    SMALL_HASH_RESET_INTERVAL,
-                    PRUNE_CONFIG,
-                    ITERATION_DIRECTION_RATIO,
-                    PRUNE_RATIO,
-                    THRESHOLD_CONFIG,
-                    FULL_COMPUTE_RATIO,
-                    SEED_CONFIG,
-                    HASH_TABLE_CONFIG,
-                    SEED_TOPK_SIZE
-                );
-            }
-            else
-            {
-                printf("Invalid INTERNAL_TOPK\n");
-                assert(false);
-            }
-            break;
-        case 768:
-            // wiki-all-10M
-            if(INTERNAL_TOPK == 64)
-            {
-                search_kernel<768, 64><<<block_dims, thread_dims, shared_size>>>
-                (
-                    d_graph_ptr,
-                    d_dataset_ptr,
-                    d_queries_ptr,
-                    d_top10_ptr,
-                    d_seed_map_ptr,
-                    d_sign_bit_ptr,
-                    d_results_indices_ptr,
-                    d_results_distances_ptr,
-                    NUM_QUERIES,
-                    TOPK,
-                    SEARCH_WIDTH,
-                    MAX_ITER,
-                    MIN_ITER,
-                    DATASET_SIZE,
-                    TEAM_SIZE,
-                    GRAPH_DEGREE,
-                    NUM_DIST,
-                    BLOCK_SIZE,
-                    BITLEN,
-                    SMALL_HASH_RESET_INTERVAL,
-                    PRUNE_CONFIG,
-                    ITERATION_DIRECTION_RATIO,
-                    PRUNE_RATIO,
-                    THRESHOLD_CONFIG,
-                    FULL_COMPUTE_RATIO,
-                    SEED_CONFIG,
-                    HASH_TABLE_CONFIG,
-                    SEED_TOPK_SIZE
-                );
-            }
-            else if(INTERNAL_TOPK == 128)
-            {
-                search_kernel<768, 128><<<block_dims, thread_dims, shared_size>>>
-                (
-                    d_graph_ptr,
-                    d_dataset_ptr,
-                    d_queries_ptr,
-                    d_top10_ptr,
-                    d_seed_map_ptr,
-                    d_sign_bit_ptr,
-                    d_results_indices_ptr,
-                    d_results_distances_ptr,
-                    NUM_QUERIES,
-                    TOPK,
-                    SEARCH_WIDTH,
-                    MAX_ITER,
-                    MIN_ITER,
-                    DATASET_SIZE,
-                    TEAM_SIZE,
-                    GRAPH_DEGREE,
-                    NUM_DIST,
-                    BLOCK_SIZE,
-                    BITLEN,
-                    SMALL_HASH_RESET_INTERVAL,
-                    PRUNE_CONFIG,
-                    ITERATION_DIRECTION_RATIO,
-                    PRUNE_RATIO,
-                    THRESHOLD_CONFIG,
-                    FULL_COMPUTE_RATIO,
-                    SEED_CONFIG,
-                    HASH_TABLE_CONFIG,
-                    SEED_TOPK_SIZE
-                );
-            }
-            else
-            {
-                printf("Invalid INTERNAL_TOPK\n");
-                assert(false);
-            }
-            break;
-        default:
-            printf("Invalid VECTOR_DIM\n");
+
+    // Instantiate based on VECTOR_DIM and INTERNAL_TOPK
+    // Add more cases as needed for other dimensions.
+    if (VECTOR_DIM == 128) {
+        if (INTERNAL_TOPK == 64) {
+            search_kernel<128, 64><<<block_dims, thread_dims, SHARED_MEM_SIZE>>>(
+                d_graph_ptr, d_dataset_ptr, d_queries_ptr, d_top10_ptr, d_seed_map_ptr, d_sign_bit_ptr,
+                d_results_indices_ptr, d_results_distances_ptr,
+                NUM_QUERIES, TOPK, SEARCH_WIDTH, MAX_ITER, MIN_ITER, DATASET_SIZE, TEAM_SIZE,
+                GRAPH_DEGREE, NUM_DIST, BLOCK_SIZE, BITLEN, SMALL_HASH_RESET_INTERVAL,
+                PRUNE_CONFIG, ITERATION_DIRECTION_RATIO, PRUNE_RATIO,
+                THRESHOLD_CONFIG, FULL_COMPUTE_RATIO, SEED_CONFIG, HASH_TABLE_CONFIG, SEED_TOPK_SIZE,
+                d_pq_codebook_ptr, d_pq_codes_ptr);
+        } else if (INTERNAL_TOPK == 128) {
+            search_kernel<128, 128><<<block_dims, thread_dims, SHARED_MEM_SIZE>>>(
+                d_graph_ptr, d_dataset_ptr, d_queries_ptr, d_top10_ptr, d_seed_map_ptr, d_sign_bit_ptr,
+                d_results_indices_ptr, d_results_distances_ptr,
+                NUM_QUERIES, TOPK, SEARCH_WIDTH, MAX_ITER, MIN_ITER, DATASET_SIZE, TEAM_SIZE,
+                GRAPH_DEGREE, NUM_DIST, BLOCK_SIZE, BITLEN, SMALL_HASH_RESET_INTERVAL,
+                PRUNE_CONFIG, ITERATION_DIRECTION_RATIO, PRUNE_RATIO,
+                THRESHOLD_CONFIG, FULL_COMPUTE_RATIO, SEED_CONFIG, HASH_TABLE_CONFIG, SEED_TOPK_SIZE,
+                d_pq_codebook_ptr, d_pq_codes_ptr);
+        } else {
+            printf("Invalid INTERNAL_TOPK for VECTOR_DIM=128\n");
             assert(false);
-        
+        }
+    } else {
+        printf("Unsupported VECTOR_DIM for PQ mode. Add new case in host code.\n");
+        assert(false);
     }
 
     return results_indices;
 }
 
-
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("search", &search, "A function that performs search on the graph");
+    m.def("search", &search, "A function that performs search on the graph using PQ distance with direction pruning fallback");
 }
